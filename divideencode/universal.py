@@ -1,10 +1,11 @@
 """Fast universal file compressor.
 
-The public universal path now uses the single-pass DE2 universal translator:
+The public universal path uses the single-pass DE2 universal translator:
 input bytes -> one representation decision per block -> DE2.
 
 The legacy DU1 decoder is retained so previously generated DU1 containers
-remain readable.
+remain readable. ``encode``/``decode`` remain compatibility aliases for the
+public universal API used by older callers and tests.
 """
 from __future__ import annotations
 
@@ -27,10 +28,8 @@ def decompress(blob: bytes, *, verify: bool = True) -> bytes:
     if src[:3] != b"DU1":
         raise NotDivideEncodedError("not a DivideEncode universal container")
 
-    # Legacy DU1 reader kept for compatibility with old files.
     import zlib
     from .bitstream import decode_varint
-    from .errors import CorruptedError
 
     if len(src) < 13 or src[3] != 2:
         raise NotDivideEncodedError("unsupported DU1 container")
@@ -52,8 +51,6 @@ def decompress(blob: bytes, *, verify: bool = True) -> bytes:
     if len(transformed) != original_size:
         raise CorruptedError("DU1 original size mismatch")
     if flags:
-        # Old DU1 used a byte residual+zigzag transform. Keep the inverse
-        # local so the compatibility path does not affect the fast encoder.
         out = bytearray(len(transformed))
         prev = 0
         for i, encoded in enumerate(transformed):
@@ -68,6 +65,11 @@ def decompress(blob: bytes, *, verify: bool = True) -> bytes:
     if verify and (zlib.crc32(data) & 0xFFFFFFFF) != source_crc:
         raise CorruptedError("DU1 source checksum mismatch")
     return data
+
+
+# Compatibility API: older versions exposed encode/decode under these names.
+encode = compress
+decode = decompress
 
 
 def transform_ratio(data: bytes) -> float:
