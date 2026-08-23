@@ -30,32 +30,21 @@ def test_empty_stream_roundtrip():
 def test_corruption_rejected():
     tokens = [(LIT, 65), (MATCH, 30, 100), (REP, 8, 0)]
     blob = bytearray(encode_tokens(tokens))
-    # The final byte may contain Huffman padding, so flipping it is not a
-    # valid corruption oracle. Flip a bit in the first actual payload byte.
+
+    # Parse the DE3C header and deliberately flip a bit in the actual
+    # Huffman payload. Do not use the final byte: it may contain padding.
     p = 5
-    count = 0
-    while True:
-        b = blob[p]
-        p += 1
-        count |= (b & 0x7F) << (7 * (p - 6))
-        if not b & 0x80:
-            break
-    nsym = 0
-    shift = 0
-    while True:
-        b = blob[p]
-        p += 1
-        nsym |= (b & 0x7F) << shift
-        if not b & 0x80:
-            break
-        shift += 7
+    _, p = _read_test_varint(blob, p)
+    nsym, p = _read_test_varint(blob, p)
     for _ in range(nsym):
-        while blob[p] & 0x80:
-            p += 1
-        p += 2
-    while blob[p] & 0x80:
-        p += 1
-    p += 1
+        _, p = _read_test_varint(blob, p)
+        p += 1  # canonical code length byte
+    payload_len, p = _read_test_varint(blob, p)
+    p += 1  # padding count
+    p += 4  # CRC32
+    assert payload_len > 0
+    assert p + payload_len == len(blob)
+
     blob[p] ^= 0x01
     try:
         decode_tokens(bytes(blob))
@@ -63,6 +52,18 @@ def test_corruption_rejected():
         pass
     else:
         raise AssertionError("corrupted DE3 payload was accepted")
+
+
+def _read_test_varint(data, p):
+    value = 0
+    shift = 0
+    while True:
+        b = data[p]
+        p += 1
+        value |= (b & 0x7f) << shift
+        if not b & 0x80:
+            return value, p
+        shift += 7
 
 
 def test_truncation_rejected():
