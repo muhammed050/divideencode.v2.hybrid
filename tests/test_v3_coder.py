@@ -30,13 +30,39 @@ def test_empty_stream_roundtrip():
 def test_corruption_rejected():
     tokens = [(LIT, 65), (MATCH, 30, 100), (REP, 8, 0)]
     blob = bytearray(encode_tokens(tokens))
-    blob[-1] ^= 0x01
+    # The final byte may contain Huffman padding, so flipping it is not a
+    # valid corruption oracle. Flip a bit in the first actual payload byte.
+    p = 5
+    count = 0
+    while True:
+        b = blob[p]
+        p += 1
+        count |= (b & 0x7F) << (7 * (p - 6))
+        if not b & 0x80:
+            break
+    nsym = 0
+    shift = 0
+    while True:
+        b = blob[p]
+        p += 1
+        nsym |= (b & 0x7F) << shift
+        if not b & 0x80:
+            break
+        shift += 7
+    for _ in range(nsym):
+        while blob[p] & 0x80:
+            p += 1
+        p += 2
+    while blob[p] & 0x80:
+        p += 1
+    p += 1
+    blob[p] ^= 0x01
     try:
         decode_tokens(bytes(blob))
     except DivideEncodeError:
         pass
     else:
-        raise AssertionError("corrupted DE3 coder stream was accepted")
+        raise AssertionError("corrupted DE3 payload was accepted")
 
 
 def test_truncation_rejected():
