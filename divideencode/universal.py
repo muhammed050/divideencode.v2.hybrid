@@ -1,126 +1,75 @@
-"""DU1 — universal reversible preconditioner with payload integrity."""
+"""Fast universal file compressor.
+
+The public universal path now uses the single-pass DE2 universal translator:
+input bytes -> one representation decision per block -> DE2.
+
+The legacy DU1 decoder is retained so previously generated DU1 containers
+remain readable.
+"""
 from __future__ import annotations
 
-import zlib
-
-from .bitstream import decode_varint, encode_varint
 from .errors import CorruptedError, NotDivideEncodedError
-
-MAGIC = b"DU1"
-# V2 adds a checksum of the exact DE2 payload.  The source checksum remains
-# as the end-to-end integrity check after the DU1 inverse transform.
-VERSION = 2
-FLAG_TRANSFORM = 1
-FLAG_IDENTITY = 0
-
-
-def _zigzag_signed(value: int) -> int:
-    return value << 1 if value >= 0 else (-value << 1) - 1
-
-
-def _unzigzag(value: int) -> int:
-    return value >> 1 if not (value & 1) else -((value >> 1) + 1)
-
-
-def encode(data: bytes) -> bytes:
-    """Apply the single universal residual+zigzag transform."""
-    src = bytes(data)
-    out = bytearray(len(src))
-    prev = 0
-    for i, value in enumerate(src):
-        residual = (value - prev) & 0xFF
-        signed = residual if residual < 128 else residual - 256
-        out[i] = _zigzag_signed(signed)
-        prev = value
-    return bytes(out)
-
-
-def decode(data: bytes, original_size: int | None = None) -> bytes:
-    """Reverse :func:`encode` byte-for-byte."""
-    src = bytes(data)
-    if original_size is not None and len(src) != original_size:
-        raise CorruptedError("DU1 transformed size mismatch")
-    out = bytearray(len(src))
-    prev = 0
-    for i, encoded in enumerate(src):
-        value = (prev + _unzigzag(encoded)) & 0xFF
-        out[i] = value
-        prev = value
-    return bytes(out)
-
-
-def _wrap(flags: int, original_size: int, payload: bytes, checksum: int) -> bytes:
-    out = bytearray(MAGIC)
-    out.append(VERSION)
-    out.append(flags)
-    out += encode_varint(original_size)
-    out += encode_varint(len(payload))
-    # The payload checksum is deliberately separate from the source checksum:
-    # DE2 may legally ignore a changed padding bit, so integrity must be
-    # checked before DE2 gets a chance to normalize/decode that payload.
-    out += (zlib.crc32(payload) & 0xFFFFFFFF).to_bytes(4, "little")
-    out += checksum.to_bytes(4, "little")
-    out += payload
-    return bytes(out)
-
-
-def _unwrap(blob: bytes) -> tuple[int, int, int, bytes]:
-    if len(blob) < 13 or blob[:3] != MAGIC:
-        raise NotDivideEncodedError("not a DU1 universal container")
-    if blob[3] != VERSION:
-        raise NotDivideEncodedError("unsupported DU1 version %d" % blob[3])
-    flags = blob[4]
-    if flags not in (FLAG_IDENTITY, FLAG_TRANSFORM):
-        raise CorruptedError("unknown DU1 flags 0x%02x" % flags)
-    original_size, pos = decode_varint(blob, 5, len(blob))
-    payload_size, pos = decode_varint(blob, pos, len(blob))
-    if pos + 8 > len(blob):
-        raise CorruptedError("DU1 checksums truncated")
-    payload_checksum = int.from_bytes(blob[pos:pos + 4], "little")
-    checksum = int.from_bytes(blob[pos + 4:pos + 8], "little")
-    pos += 8
-    if payload_size != len(blob) - pos:
-        raise CorruptedError("DU1 payload size mismatch")
-    payload = bytes(blob[pos:])
-    if (zlib.crc32(payload) & 0xFFFFFFFF) != payload_checksum:
-        raise CorruptedError("DU1 payload checksum mismatch")
-    return flags, original_size, checksum, payload
 
 
 def compress(data: bytes, *, block_size: int = 1 << 20,
              level: str = "BALANCED") -> bytes:
-    """DU1 -> DE2 with exact payload integrity protection."""
+    """Compress any bytes using the single universal DE2 path."""
     from .de2 import compress as de2_compress
-
-    src = bytes(data)
-    transformed = encode(src)
-    transformed_de2 = de2_compress(transformed, block_size=block_size,
-                                   level=level)
-    direct_de2 = de2_compress(src, block_size=block_size, level=level)
-    if len(transformed_de2) < len(direct_de2):
-        flags = FLAG_TRANSFORM
-        payload = transformed_de2
-    else:
-        flags = FLAG_IDENTITY
-        payload = direct_de2
-
-    return _wrap(flags, len(src), payload, zlib.crc32(src) & 0xFFFFFFFF)
+    return de2_compress(bytes(data), block_size=block_size, level=level)
 
 
 def decompress(blob: bytes, *, verify: bool = True) -> bytes:
-    """DE2 -> DU1 inverse -> original bytes."""
-    from .de2 import decompress as de2_decompress
+    """Decode the current DE2 universal format or a legacy DU1 container."""
+    src = bytes(blob)
+    if src[:3] == b"DE2":
+        from .de2 import decompress as de2_decompress
+        return de2_decompress(src, verify=verify)
+    if src[:3] != b"DU1":
+        raise NotDivideEncodedError("not a DivideEncode universal container")
 
-    flags, original_size, checksum, payload = _unwrap(bytes(blob))
+    # Legacy DU1 reader kept for compatibility with old files.
+    import zlib
+    from .bitstream import decode_varint
+    from .errors import CorruptedError
+
+    if len(src) < 13 or src[3] != 2:
+        raise NotDivideEncodedError("unsupported DU1 container")
+    flags = src[4]
+    if flags not in (0, 1):
+        raise CorruptedError("unknown DU1 flags")
+    original_size, pos = decode_varint(src, 5, len(src))
+    payload_size, pos = decode_varint(src, pos, len(src))
+    if pos + 8 > len(src) or payload_size != len(src) - pos - 8:
+        raise CorruptedError("DU1 container truncated")
+    payload_crc = int.from_bytes(src[pos:pos + 4], "little")
+    source_crc = int.from_bytes(src[pos + 4:pos + 8], "little")
+    pos += 8
+    payload = src[pos:]
+    if (zlib.crc32(payload) & 0xFFFFFFFF) != payload_crc:
+        raise CorruptedError("DU1 payload checksum mismatch")
+    from .de2 import decompress as de2_decompress
     transformed = de2_decompress(payload, verify=verify)
     if len(transformed) != original_size:
         raise CorruptedError("DU1 original size mismatch")
-    data = decode(transformed, original_size) if flags == FLAG_TRANSFORM else transformed
-    if verify and (zlib.crc32(data) & 0xFFFFFFFF) != checksum:
+    if flags:
+        # Old DU1 used a byte residual+zigzag transform. Keep the inverse
+        # local so the compatibility path does not affect the fast encoder.
+        out = bytearray(len(transformed))
+        prev = 0
+        for i, encoded in enumerate(transformed):
+            value = encoded >> 1
+            if encoded & 1:
+                value = -value - 1
+            out[i] = (prev + value) & 0xFF
+            prev = out[i]
+        data = bytes(out)
+    else:
+        data = transformed
+    if verify and (zlib.crc32(data) & 0xFFFFFFFF) != source_crc:
         raise CorruptedError("DU1 source checksum mismatch")
     return data
 
 
 def transform_ratio(data: bytes) -> float:
-    """Return transformed-byte size / source-byte size."""
+    """Legacy compatibility helper; the current path is adaptive per block."""
     return 1.0
