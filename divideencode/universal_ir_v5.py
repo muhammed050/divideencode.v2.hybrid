@@ -1,8 +1,8 @@
 """UBIR5 — universal phrase/token translator for DE2.
 
-Goal: turn arbitrary byte streams into a small alphabet + explicit dictionary
-language that DE2 can model easily.  It is reversible and may grow; DE2
-chooses whether the representation is actually useful.
+Fast path: one-pass fixed-window counting, cheap gain ranking, then a single
+materialization pass. The representation is reversible and may grow; DE2
+chooses whether it is useful.
 """
 from __future__ import annotations
 
@@ -21,123 +21,100 @@ class PhraseCandidate:
     gain: int
 
 
-def _count_nonoverlap(src: bytes, phrase: bytes) -> int:
-    n = len(phrase)
-    if n == 0:
-        return 0
-    count = 0
-    i = 0
-    while i <= len(src) - n:
-        j = src.find(phrase, i)
-        if j < 0:
-            break
-        count += 1
-        i = j + n
-    return count
-
-
 def _candidate_phrases(src: bytes, lengths: tuple[int, ...], max_dict: int) -> list[PhraseCandidate]:
-    candidates: list[PhraseCandidate] = []
-    # Fixed-length windows keep analysis predictable and fast.  We sample the
-    # whole input for small files and a bounded prefix for very large files.
+    """Find useful phrases without repeatedly scanning the source.
+
+    The old selector called ``bytes.find`` for every candidate and then rebuilt
+    a temporary ``working`` byte string after every dictionary selection. That
+    made preparation roughly O(candidates * input). We now rank candidates
+    using one Counter pass per length and leave exact overlap handling to the
+    final tokenization pass.
+    """
     sample = src if len(src) <= 8 * 1024 * 1024 else src[:8 * 1024 * 1024]
+    candidates: list[PhraseCandidate] = []
     for length in lengths:
         if length > len(sample):
             continue
         counts = Counter(sample[i:i + length] for i in range(len(sample) - length + 1))
-        for phrase, freq in counts.most_common(max_dict * 3):
+        for phrase, freq in counts.most_common(max_dict * 2):
             if freq < 2:
                 break
-            # A token costs 2 bytes in the IR (ESC + id).  Dictionary storage
-            # costs the phrase length once.  Only retain phrases with a clear
-            # gross saving before overlap effects.
-            gain = freq * max(0, length - 2) - length
+            gain = freq * (length - 2) - length
             if gain > 0:
                 candidates.append(PhraseCandidate(phrase, freq, gain))
     candidates.sort(key=lambda x: (x.gain, x.count, len(x.phrase)), reverse=True)
-    return candidates[: max_dict * 8]
+    return candidates[: max_dict * 4]
 
 
 def _select_dictionary(src: bytes, lengths: tuple[int, ...], max_dict: int) -> list[bytes]:
+    """Select a compact non-redundant dictionary using estimated gains.
+
+    Exact occurrence rescans are deliberately avoided here. Overlap is handled
+    naturally by the longest-first token matcher below, which is both faster and
+    gives a deterministic result.
+    """
     selected: list[bytes] = []
-    working = src
     for cand in _candidate_phrases(src, lengths, max_dict):
         if len(selected) >= max_dict:
             break
-        # Re-evaluate against already selected phrases.  This discourages a
-        # large dictionary full of overlapping variants.
-        if any(cand.phrase in p or p in cand.phrase for p in selected):
+        p = cand.phrase
+        if any(p in q or q in p for q in selected):
             continue
-        count = _count_nonoverlap(working, cand.phrase)
-        if count >= 2 and count * (len(cand.phrase) - 2) > len(cand.phrase):
-            selected.append(cand.phrase)
-            working = _replace_with_marker(working, cand.phrase, b"")
+        selected.append(p)
     return selected
 
 
-def _replace_with_marker(src: bytes, phrase: bytes, marker: bytes) -> bytes:
-    if not phrase:
-        return src
-    out = bytearray()
-    i = 0
-    n = len(phrase)
-    while i < len(src):
-        if i + n <= len(src) and src[i:i + n] == phrase:
-            out.extend(marker)
-            i += n
-        else:
-            out.append(src[i])
-            i += 1
-    return bytes(out)
-
-
 def _encode_tokens(src: bytes, dictionary: list[bytes]) -> bytes:
-    # Literal bytes are escaped only when they equal ESC.  Phrase references
-    # are ESC, id+1.  Thus the token alphabet remains tiny and deterministic.
+    # Index phrases by first byte and test longest phrases first. This avoids
+    # comparing every dictionary entry at every input position.
     by_first: dict[int, list[tuple[bytes, int]]] = {}
     for idx, phrase in enumerate(dictionary):
         by_first.setdefault(phrase[0], []).append((phrase, idx + 1))
     for values in by_first.values():
         values.sort(key=lambda x: len(x[0]), reverse=True)
+
     out = bytearray()
+    append = out.extend
+    startswith = src.startswith
     i = 0
-    while i < len(src):
+    n = len(src)
+    while i < n:
         matches = by_first.get(src[i])
-        matched = None
         if matches:
             for phrase, token in matches:
-                if src.startswith(phrase, i):
-                    matched = (phrase, token)
+                if startswith(phrase, i):
+                    append((ESC, token))
+                    i += len(phrase)
                     break
-        if matched:
-            out.extend((ESC, matched[1]))
-            i += len(matched[0])
+            else:
+                b = src[i]
+                append((ESC, 0) if b == ESC else (b,))
+                i += 1
         else:
             b = src[i]
-            if b == ESC:
-                out.extend((ESC, 0))
-            else:
-                out.append(b)
+            append((ESC, 0) if b == ESC else (b,))
             i += 1
     return bytes(out)
 
 
 def _decode_tokens(tokens: bytes, dictionary: list[bytes]) -> bytes:
     out = bytearray()
+    append = out.extend
     i = 0
-    while i < len(tokens):
+    n = len(tokens)
+    while i < n:
         b = tokens[i]
         if b != ESC:
             out.append(b)
             i += 1
             continue
-        if i + 1 >= len(tokens):
+        if i + 1 >= n:
             raise ValueError("truncated UBIR5 escape")
         code = tokens[i + 1]
         if code == 0:
             out.append(ESC)
         elif code - 1 < len(dictionary):
-            out.extend(dictionary[code - 1])
+            append(dictionary[code - 1])
         else:
             raise ValueError("invalid UBIR5 dictionary reference")
         i += 2
@@ -148,8 +125,6 @@ def encode(src: bytes, *, phrase_lengths: tuple[int, ...] = (4, 5, 6, 8, 12, 16)
     src = bytes(src)
     dictionary = _select_dictionary(src, phrase_lengths, max_dict)
     tokens = _encode_tokens(src, dictionary)
-    # Dictionary and token stream are kept as separate regions.  The container
-    # is intentionally simple: MAGIC, count, lengths, dictionary bytes, tokens.
     if len(dictionary) > 255:
         raise ValueError("UBIR5 dictionary overflow")
     header = bytearray(MAGIC)
