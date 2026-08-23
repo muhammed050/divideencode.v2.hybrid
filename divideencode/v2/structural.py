@@ -18,7 +18,17 @@ class Candidate:
     score: int
 
 
+@dataclass(frozen=True)
+class Decision:
+    """Selected representation for a downstream compressor."""
+    kind: str
+    blob: bytes
+    structural_size: int
+    downstream_size: int | None
+
+
 MAGIC = b"SD1"
+_KIND_TO_ID = {"delta": 1, "rle": 2, "dict": 3}
 
 
 def _varint(n: int) -> bytes:
@@ -62,7 +72,6 @@ def _undelta(values):
 
 
 def _encode_svarint(x: int) -> bytes:
-    # Zigzag + varint.
     return _varint((x << 1) ^ (x >> 63))
 
 
@@ -99,7 +108,6 @@ def _delta_candidate(data: bytes):
     for width, fmt, vals in _numeric_sequence(data):
         ds = _signed_delta(vals)
         packed = b"".join(_encode_svarint(x) for x in ds)
-        # Self-delimiting metadata: width | format-length | format | count.
         fmt_bytes = fmt.encode("ascii")
         meta = bytes((width, len(fmt_bytes))) + fmt_bytes + _varint(len(vals))
         total = len(MAGIC) + 1 + len(_varint(len(meta))) + len(meta) + len(packed)
@@ -134,7 +142,6 @@ def _rle_candidate(data: bytes):
 
 
 def _dictionary_candidate(data: bytes):
-    # Repeated fixed-size chunks. This intentionally stays conservative.
     best = None
     for size in (2, 3, 4, 5, 6, 8, 12, 16, 24, 32):
         if len(data) < size * 8 or len(data) % size:
@@ -167,7 +174,7 @@ def _dictionary_candidate(data: bytes):
 
 
 def analyze(data: bytes):
-    """Return conservative structural candidates ordered by final size."""
+    """Return conservative structural candidates ordered by own size."""
     candidates = []
     for fn in (_delta_candidate, _rle_candidate, _dictionary_candidate):
         c = fn(data)
@@ -176,14 +183,55 @@ def analyze(data: bytes):
     return sorted(candidates, key=lambda x: x.score)
 
 
+def _candidate_blob(c: Candidate) -> bytes:
+    return MAGIC + bytes((_KIND_TO_ID[c.kind],)) + _varint(len(c.meta)) + c.meta + c.payload
+
+
+def _raw_blob(data: bytes) -> bytes:
+    return MAGIC + b"\x00" + data
+
+
 def transform(data: bytes) -> bytes:
     """Choose the smallest structural representation, or store raw."""
     candidates = analyze(data)
     if not candidates:
-        return MAGIC + b"\x00" + data
-    c = candidates[0]
-    kind = {"delta": 1, "rle": 2, "dict": 3}[c.kind]
-    return MAGIC + bytes((kind,)) + _varint(len(c.meta)) + c.meta + c.payload
+        return _raw_blob(data)
+    return _candidate_blob(candidates[0])
+
+
+def adaptive_transform(data: bytes, scorer=None) -> Decision:
+    """Choose the representation that is actually best downstream.
+
+    ``scorer`` receives a byte representation and returns its final cost,
+    normally the size produced by DE2. When supplied, RAW and every
+    structural candidate are compared using that real downstream cost.
+    Without a scorer this falls back to the conservative structural-size
+    decision used by :func:`transform`.
+
+    This is deliberately not a "try every compressor" policy: the structural
+    engine still discovers and compares only its own representations; the
+    downstream scorer merely measures how well each representation exposes
+    structure to the fixed Divide compressor.
+    """
+    candidates = analyze(data)
+    if scorer is None:
+        blob = transform(data)
+        kind = "raw" if blob[3] == 0 else next(
+            k for k, v in _KIND_TO_ID.items() if v == blob[3]
+        )
+        return Decision(kind, blob, len(blob), None)
+
+    options = [("raw", _raw_blob(data))]
+    options.extend((c.kind, _candidate_blob(c)) for c in candidates)
+
+    best_kind, best_blob = options[0]
+    best_cost = scorer(best_blob)
+    for kind, blob in options[1:]:
+        cost = scorer(blob)
+        if cost < best_cost:
+            best_kind, best_blob, best_cost = kind, blob, cost
+
+    return Decision(best_kind, best_blob, len(best_blob), best_cost)
 
 
 def inverse(blob: bytes) -> bytes:
