@@ -1,17 +1,14 @@
-"""Measure the DE3 merged token coder against the current V3 frame.
-
-This benchmark deliberately does not change the production codec. It reuses
-V3's existing tokenizer, reconstructs its token sequence from the separated
-literal/length/distance streams, and then serializes the same tokens with the
-DE3-derived merged canonical-Huffman coder. That isolates the representation
-change before we wire a new frame into the codec.
-"""
+"""Measure the DE3 merged token coder against the current V3 frame."""
 from pathlib import Path
+import sys
 import time
+
+# Make direct execution from benchmarks/ work from a source checkout.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from divideencode.bitstream import decode_varint
 from divideencode.de2 import lz
-from divideencode.v3.coder import encode_tokens
+from divideencode.v3.coder import encode_tokens, decode_tokens
 
 CORPUS = Path(__file__).parent / "corpus"
 
@@ -19,10 +16,7 @@ CORPUS = Path(__file__).parent / "corpus"
 def _tokens_from_v3(data, level="BALANCED"):
     nm, literals, ll, ml, dist = lz._tokenize(data, level=level)
     tokens = []
-    p_lit = 0
-    p_ll = 0
-    p_ml = 0
-    p_ds = 0
+    p_lit = p_ll = p_ml = p_ds = 0
     for _ in range(nm):
         lit_len, p_ll = decode_varint(ll, p_ll, len(ll))
         if p_lit + lit_len > len(literals):
@@ -62,8 +56,10 @@ def main():
         t1 = time.perf_counter()
         tokens = _tokens_from_v3(data, level="BALANCED")
         new = encode_tokens(tokens)
+        assert decode_tokens(new) == tokens
         t2 = time.perf_counter()
-        if lz.decode_v2(old, 0, len(old), len(data), lz.entropy.DecodeTables())[0] != data:
+        decoded, end = lz.decode_v2(old, 0, len(old), len(data), lz.entropy.DecodeTables())
+        if end != len(old) or decoded != data:
             raise AssertionError(f"V3 roundtrip failed: {path.name}")
 
         total_old += len(old)
