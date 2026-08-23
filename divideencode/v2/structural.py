@@ -202,16 +202,9 @@ def transform(data: bytes) -> bytes:
 def adaptive_transform(data: bytes, scorer=None) -> Decision:
     """Choose the representation that is actually best downstream.
 
-    ``scorer`` receives a byte representation and returns its final cost,
-    normally the size produced by DE2. When supplied, RAW and every
-    structural candidate are compared using that real downstream cost.
-    Without a scorer this falls back to the conservative structural-size
-    decision used by :func:`transform`.
-
-    This is deliberately not a "try every compressor" policy: the structural
-    engine still discovers and compares only its own representations; the
-    downstream scorer merely measures how well each representation exposes
-    structure to the fixed Divide compressor.
+    ``scorer`` receives the exact bytes that will be passed to the downstream
+    compressor and returns its final cost. With a DE2 scorer this compares
+    RAW against every structural representation using the real DE2 size.
     """
     candidates = analyze(data)
     if scorer is None:
@@ -221,13 +214,15 @@ def adaptive_transform(data: bytes, scorer=None) -> Decision:
         )
         return Decision(kind, blob, len(blob), None)
 
-    options = [("raw", _raw_blob(data))]
-    options.extend((c.kind, _candidate_blob(c)) for c in candidates)
+    # The raw branch must be scored as the original bytes, not as SD1+raw.
+    # The SD1 wrapper exists only so Decision.blob remains reversible.
+    options = [("raw", _raw_blob(data), data)]
+    options.extend((c.kind, _candidate_blob(c), _candidate_blob(c)) for c in candidates)
 
-    best_kind, best_blob = options[0]
-    best_cost = scorer(best_blob)
-    for kind, blob in options[1:]:
-        cost = scorer(blob)
+    best_kind, best_blob, best_input = options[0]
+    best_cost = scorer(best_input)
+    for kind, blob, downstream_input in options[1:]:
+        cost = scorer(downstream_input)
         if cost < best_cost:
             best_kind, best_blob, best_cost = kind, blob, cost
 
