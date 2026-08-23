@@ -1,9 +1,9 @@
 """DE3 representation search.
 
-Goal: minimize final encoded size, not encode speed.  DE3 treats DivideEncode
-as a representation search problem: generate reversible transforms, recursively
-compose useful transforms, then let a final entropy/LZ coder encode the winning
-representation.  Every candidate carries its exact metadata cost.
+Goal: minimize final encoded size, not encode speed. DE3 treats DivideEncode
+as a representation-search problem: generate reversible transforms, compose
+useful transforms, and eventually let a final entropy/LZ coder encode the
+winning representation. Every candidate carries metadata cost.
 """
 from __future__ import annotations
 
@@ -12,10 +12,11 @@ from typing import Callable, Optional
 
 from .divide_transform import DIVISORS, WORD_SIZES, divide_reconstruct, divide_transform
 
+HEADER_SIZE = 22
+
 
 @dataclass(frozen=True)
 class Representation:
-    """A reversible representation with an exact-ish cost model."""
     name: str
     data: bytes
     metadata: bytes = b""
@@ -43,9 +44,6 @@ def _divide_candidate(data: bytes, w: int, d: int) -> Optional[Representation]:
         return None
     q = t["quotient_stream"]
     r = t["remainder_stream"]
-    # Header is deliberately explicit in DE3.  The production bitstream can
-    # replace this fixed accounting with varints, but search must never pretend
-    # metadata is free.
     header = (
         b"DV3"
         + bytes((w,))
@@ -54,34 +52,24 @@ def _divide_candidate(data: bytes, w: int, d: int) -> Optional[Representation]:
         + bytes((t["wq"], t["rbits"]))
         + len(t["tail"]).to_bytes(4, "little")
     )
-    body = q + r + t["tail"]
-    return Representation(f"divide(w={w},d={d})", body, header)
+    return Representation(f"divide(w={w},d={d})", q + r + t["tail"], header)
 
 
 def generate_divide_candidates(data: bytes, limit: int = 12) -> list[Representation]:
-    """Generate reversible Divide representations and rank by total bytes."""
     out: list[Representation] = []
     for w in WORD_SIZES:
         if len(data) < 4 * w:
             continue
         for d in DIVISORS:
-            if d > 65536:
-                continue
             cand = _divide_candidate(data, w, d)
-            if cand is not None and cand.total_size < len(data) + 64:
+            if cand is not None and cand.total_size < len(data) + HEADER_SIZE:
                 out.append(cand)
     out.sort(key=lambda x: x.total_size)
     return out[:limit]
 
 
 def search_representations(data: bytes, *, beam: int = 16, max_depth: int = 2) -> Representation:
-    """Beam-search reversible representations.
-
-    This is intentionally independent of the final compressor.  A future stage
-    can plug in entropy/LZ cost estimation; for now we select on exact raw
-    transformed bytes + representation metadata, giving us a safe foundation
-    for discovering transformations that genuinely reduce the representation.
-    """
+    """Beam-search reversible representations using exact byte accounting."""
     root = identity(data)
     beam_items = [root]
     best = root
@@ -108,22 +96,25 @@ def search_representations(data: bytes, *, beam: int = 16, max_depth: int = 2) -
         beam_items = expanded[:beam]
         if beam_items[0].total_size < best.total_size:
             best = beam_items[0]
-
     return best
 
 
 def reconstruct_divide(data: bytes, metadata: bytes) -> bytes:
     """Decode one DV3 Divide representation header/body."""
-    if len(metadata) < 21 or metadata[:3] != b"DV3":
+    if len(metadata) < HEADER_SIZE or metadata[:3] != b"DV3":
         raise ValueError("invalid DE3 Divide metadata")
     w = metadata[3]
     d = int.from_bytes(metadata[4:8], "little")
     n_words = int.from_bytes(metadata[8:16], "little")
-    wq, rbits = metadata[16], metadata[17]
-    tail_len = int.from_bytes(metadata[17:21], "little")
+    wq = metadata[16]
+    rbits = metadata[17]
+    tail_len = int.from_bytes(metadata[18:22], "little")
     q_len = n_words * wq
     r_len = (n_words * rbits + 7) // 8
+    body_len = q_len + r_len + tail_len
+    if len(data) != body_len:
+        raise ValueError("invalid DV3 body size")
     q = data[:q_len]
     r = data[q_len:q_len + r_len]
-    tail = data[q_len + r_len:q_len + r_len + tail_len]
+    tail = data[q_len + r_len:]
     return divide_reconstruct(q, r, w, d, wq, rbits, n_words, tail)
