@@ -3,7 +3,7 @@
 Phrase6 is the strongest candidate found so far.  This version keeps the
 experiment focused on frequency-ranked 6-byte dictionaries, removes the
 expensive greedy/non-overlap search, uses O(1) phrase lookup during encoding,
-and prints progress so long runs are visible.
+and uses a cheap proxy stage to avoid running DE2 for every dictionary size.
 """
 from __future__ import annotations
 
@@ -156,21 +156,54 @@ def _frequency6(pool: list[bytes], limit: int) -> list[bytes]:
     return pool[:limit]
 
 
-def candidates(src: bytes):
+def candidates(src: bytes, max_de2_trials: int = 3):
+    """Build all cheap proxies, then send only the most promising to DE2.
+
+    The old benchmark spent one full DE2 pass on every limit.  The proxy
+    (dictionary header + encoded representation) is dramatically cheaper.
+    We rank all configured limits by proxy size and run DE2 only on the best
+    few, which keeps direct-DE2 as the mandatory fallback.
+    """
     pool = _discover6(src)
     if not pool:
         return
 
-    # Focus the expensive DE2 stage around the known-good 128-entry region.
-    # Keep only one dictionary strategy; all other variants were consistently
-    # slower and did not beat frequency ranking in the previous run.
     limits = (64, 96, 112, 128, 144, 160, 192, 255)
+    proxies: list[tuple[int, int, Candidate]] = []
     for limit in limits:
         dictionary = _frequency6(pool, limit)
         if not dictionary:
             continue
         packed = _pack(dictionary, _encode(src, dictionary), len(src))
-        yield Candidate(f"phrase6_freq{limit}", packed, tuple(dictionary))
+        proxies.append((len(packed), limit, Candidate(
+            f"phrase6_freq{limit}", packed, tuple(dictionary))))
+
+    # The proxy is not the final metric, so keep a small safety margin:
+    # always test the proxy winner plus two structurally different points.
+    # This is still only 3 DE2 runs instead of 8.
+    proxies.sort(key=lambda x: (x[0], x[1]))
+    chosen: list[tuple[int, int, Candidate]] = []
+    seen: set[int] = set()
+
+    def add_at(index: int):
+        if 0 <= index < len(proxies):
+            item = proxies[index]
+            if item[1] not in seen and len(chosen) < max_de2_trials:
+                chosen.append(item)
+                seen.add(item[1])
+
+    add_at(0)
+    # Also retain the largest dictionary when it is not the proxy winner;
+    # 255 was a real winner in the previous DE2 measurements.
+    for idx, item in enumerate(proxies):
+        if item[1] == 255:
+            add_at(idx)
+            break
+    # One middle candidate protects against proxy/DE2 disagreement.
+    add_at(len(proxies) // 2)
+
+    for _, _, cand in chosen:
+        yield cand
 
 
 def main():
@@ -178,8 +211,8 @@ def main():
     if not files:
         raise SystemExit(f"No corpus files found in {CORPUS}")
 
-    print("DE2-AWARE PHRASE6 — FAST SEARCH")
-    print("frequency-only dictionaries + O(1) phrase lookup + progress", flush=True)
+    print("DE2-AWARE PHRASE6 — SPEED-AWARE SEARCH")
+    print("cheap proxy ranking + max 3 DE2 trials + direct-DE2 fallback", flush=True)
 
     total_files = len(files)
     for file_no, path in enumerate(files, 1):
@@ -192,7 +225,7 @@ def main():
 
         best_size = len(direct)
         best_name = "direct-DE2"
-        cands = list(candidates(src))
+        cands = list(candidates(src, max_de2_trials=3))
         total = len(cands)
         for idx, cand in enumerate(cands, 1):
             print(f"  [{idx}/{total}] {cand.name}: DE2...", end="", flush=True)
