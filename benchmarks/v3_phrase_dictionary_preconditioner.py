@@ -1,13 +1,14 @@
-"""DE2-aware phrase6 preconditioner experiments.
+"""Fast DE2-aware phrase6 preconditioner benchmark.
 
-Phrase6 is the strongest general candidate found so far.  This benchmark
-removes the broad phrase-length matrix and concentrates the search budget on
-variants derived from 6-byte phrases.  Every candidate is judged by the final
-DE2 size and must round-trip exactly.
+Phrase6 is the strongest candidate found so far.  This version keeps the
+experiment focused on frequency-ranked 6-byte dictionaries, removes the
+expensive greedy/non-overlap search, uses O(1) phrase lookup during encoding,
+and prints progress so long runs are visible.
 """
 from __future__ import annotations
 
 import struct
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,133 +99,61 @@ def _decode(blob: bytes) -> bytes:
 
 
 def _discover6(src: bytes, max_entries: int = 255, min_count: int = 3):
-    """Rank all repeated 6-byte phrases by useful coverage.
-
-    Unlike the old mixed-length search, the experiment deliberately spends its
-    discovery budget only on six-byte phrases.  This keeps comparisons clean
-    and makes each new variant a real improvement over phrase6 rather than a
-    different compressor.
-    """
+    """Discover repeated 6-byte phrases with bounded deterministic work."""
     length = 6
     if len(src) < length * min_count:
         return []
     counts: dict[bytes, int] = {}
     total = len(src) - length + 1
-    # Keep runtime bounded while still sampling every offset on normal corpus
-    # files.  Large files use a deterministic dense stride.
     stride = max(1, total // 2_000_000)
     for i in range(0, total, stride):
         p = src[i:i + length]
         counts[p] = counts.get(p, 0) + 1
     ranked = [(n, p) for p, n in counts.items() if n >= min_count]
-    ranked.sort(key=lambda x: (-(x[0] * 4), -x[0], x[1]))
+    ranked.sort(key=lambda x: (-x[0], x[1]))
     return [p for _, p in ranked[:max_entries]]
 
 
 def _encode(src: bytes, dictionary: list[bytes]) -> bytes:
-    by_first: dict[int, list[tuple[bytes, int]]] = {}
-    for idx, p in enumerate(dictionary, 1):
-        by_first.setdefault(p[0], []).append((p, idx))
+    """Fast phrase6 encoder: all phrases have length six, so use O(1) lookup."""
+    ids = {p: idx for idx, p in enumerate(dictionary, 1)}
     out = bytearray()
-    literal = bytearray()
+    literal_start = 0
     i = 0
-    while i < len(src):
-        found = None
-        for p, idx in by_first.get(src[i], ()):
-            if src.startswith(p, i):
-                found = (p, idx)
-                break
-        if found:
-            if literal:
-                while literal:
-                    n = min(255, len(literal))
-                    out.append(0); out.append(n); out += literal[:n]
-                    del literal[:n]
-            p, idx = found
-            out.append(idx)
-            i += 6
-        else:
-            literal.append(src[i])
+    n = len(src)
+
+    while i + 6 <= n:
+        idx = ids.get(src[i:i + 6])
+        if idx is None:
             i += 1
-    while literal:
-        n = min(255, len(literal))
-        out.append(0); out.append(n); out += literal[:n]
-        del literal[:n]
+            continue
+        if literal_start < i:
+            literal = src[literal_start:i]
+            pos = 0
+            while pos < len(literal):
+                chunk = literal[pos:pos + 255]
+                out.append(0)
+                out.append(len(chunk))
+                out += chunk
+                pos += len(chunk)
+        out.append(idx)
+        i += 6
+        literal_start = i
+
+    if literal_start < n:
+        literal = src[literal_start:]
+        pos = 0
+        while pos < len(literal):
+            chunk = literal[pos:pos + 255]
+            out.append(0)
+            out.append(len(chunk))
+            out += chunk
+            pos += len(chunk)
     return bytes(out)
 
 
-def _frequency6(src: bytes, pool: list[bytes], limit: int) -> list[bytes]:
-    """Original phrase6 strategy: frequency/coverage ranking."""
+def _frequency6(pool: list[bytes], limit: int) -> list[bytes]:
     return pool[:limit]
-
-
-def _nonoverlap6(src: bytes, pool: list[bytes], limit: int) -> list[bytes]:
-    """Prefer phrases whose occurrences are useful without overlap waste."""
-    scored = []
-    for p in pool:
-        count = 0
-        pos = 0
-        while True:
-            j = src.find(p, pos)
-            if j < 0:
-                break
-            count += 1
-            pos = j + 6
-        scored.append((count * 4, count, p))
-    scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
-    return [p for _, _, p in scored[:limit]]
-
-
-def _greedy6(src: bytes, pool: list[bytes], limit: int, top_probe: int = 24) -> list[bytes]:
-    """Greedy phrase6 dictionary: choose entries by measured stream gain."""
-    selected: list[bytes] = []
-    selected_set: set[bytes] = set()
-    current_len = len(src)
-    remaining = pool[:]
-    while len(selected) < limit and remaining:
-        best = None
-        best_gain = 0
-        for p in remaining[:top_probe]:
-            trial = _encode(src, selected + [p])
-            gain = current_len - len(trial)
-            # One dictionary entry costs one length byte plus six phrase bytes.
-            gain -= 7
-            if gain > best_gain:
-                best_gain = gain
-                best = p
-        if best is None:
-            break
-        selected.append(best)
-        selected_set.add(best)
-        current_len = len(_encode(src, selected))
-        remaining = [p for p in remaining if p not in selected_set]
-    return selected
-
-
-def _greedy6_reorder(src: bytes, pool: list[bytes], limit: int) -> list[bytes]:
-    """Build with measured gains, then reorder IDs by stream frequency.
-
-    The byte stream is semantically identical after re-encoding, but putting
-    the most frequent IDs first can improve DE2's symbol statistics in some
-    inputs because IDs become a compact low-valued alphabet.
-    """
-    selected = _greedy6(src, pool, limit, top_probe=32)
-    if not selected:
-        return []
-    freq = []
-    stream = _encode(src, selected)
-    counts = [0] * len(selected)
-    i = 0
-    while i < len(stream):
-        code = stream[i]; i += 1
-        if code:
-            counts[code - 1] += 1
-        else:
-            if i >= len(stream):
-                break
-            n = stream[i]; i += 1 + n
-    freq = sorted(range(len(selected)), key=lambda i: (-counts[i], selected[i]))
-    return [selected[i] for i in freq]
 
 
 def candidates(src: bytes):
@@ -232,38 +161,41 @@ def candidates(src: bytes):
     if not pool:
         return
 
-    # Only phrase6-derived candidates remain.  Limits cover the useful small,
-    # medium and full dictionaries without reopening the old length matrix.
-    for limit in (48, 96, 128, 192, 255):
-        variants = (
-            (f"phrase6_freq{limit}", _frequency6(src, pool, limit)),
-            (f"phrase6_nonoverlap{limit}", _nonoverlap6(src, pool, limit)),
-            (f"phrase6_greedy{limit}", _greedy6(src, pool, limit)),
-            (f"phrase6_greedy_reorder{limit}", _greedy6_reorder(src, pool, limit)),
-        )
-        for name, dictionary in variants:
-            if not dictionary:
-                continue
-            packed = _pack(dictionary, _encode(src, dictionary), len(src))
-            yield Candidate(name, packed, tuple(dictionary))
+    # Focus the expensive DE2 stage around the known-good 128-entry region.
+    # Keep only one dictionary strategy; all other variants were consistently
+    # slower and did not beat frequency ranking in the previous run.
+    limits = (64, 96, 112, 128, 144, 160, 192, 255)
+    for limit in limits:
+        dictionary = _frequency6(pool, limit)
+        if not dictionary:
+            continue
+        packed = _pack(dictionary, _encode(src, dictionary), len(src))
+        yield Candidate(f"phrase6_freq{limit}", packed, tuple(dictionary))
 
 
 def main():
     files = sorted(p for p in CORPUS.iterdir() if p.is_file()) if CORPUS.exists() else []
     if not files:
         raise SystemExit(f"No corpus files found in {CORPUS}")
-    print("DE2-AWARE PHRASE6 VARIANTS")
-    print("frequency + non-overlap + greedy + ID-reorder; winner = smallest verified final DE2")
 
-    for path in files:
+    print("DE2-AWARE PHRASE6 — FAST SEARCH")
+    print("frequency-only dictionaries + O(1) phrase lookup + progress", flush=True)
+
+    total_files = len(files)
+    for file_no, path in enumerate(files, 1):
         src = path.read_bytes()
+        print(f"\n[{file_no}/{total_files}] {path.name}: direct DE2...", flush=True)
         direct, de, dd = run_de2(src)
-        print("\n" + "=" * 100)
+        print("=" * 100)
         print(f"{path.name} original={len(src):,} B")
-        print(f"  direct-DE2 final={len(direct):,} B ratio={len(direct)/len(src):.4f} enc={de:.3f}s dec={dd:.3f}s")
+        print(f"  direct-DE2 final={len(direct):,} B ratio={len(direct)/len(src):.4f} enc={de:.3f}s dec={dd:.3f}s", flush=True)
+
         best_size = len(direct)
         best_name = "direct-DE2"
-        for cand in candidates(src):
+        cands = list(candidates(src))
+        total = len(cands)
+        for idx, cand in enumerate(cands, 1):
+            print(f"  [{idx}/{total}] {cand.name}: DE2...", end="", flush=True)
             blob, enc, dec = run_de2(cand.packed)
             ok = _decode(cand.packed) == src
             if not ok:
@@ -271,8 +203,10 @@ def main():
             if len(blob) < best_size:
                 best_size = len(blob)
                 best_name = cand.name
-            print(f"  {cand.name:<25} dict={len(cand.dictionary):3d} repr={len(cand.packed):9,d} DE2={len(blob):9,d} ratio={len(blob)/len(src):.4f} enc={enc:.3f}s dec={dec:.3f}s ok")
-        print(f"  WINNER {best_name}; gain_vs_direct={len(direct)-best_size:+,} B")
+            print(f" {len(blob):,} B ({enc:.3f}s) ok", flush=True)
+
+        print(f"  WINNER {best_name}; gain_vs_direct={len(direct)-best_size:+,} B", flush=True)
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
