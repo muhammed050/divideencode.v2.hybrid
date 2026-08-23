@@ -17,7 +17,7 @@ class TestBoundedParser(unittest.TestCase):
             b"abcabcabcabc" * 500,
             b"0123456789abcdef" * 1000,
             bytes(range(256)) * 300,
-            (b"The quick brown fox jumps over the lazy dog. " * 1000),
+            b"The quick brown fox jumps over the lazy dog. " * 1000,
         ]
         for data in cases:
             for lookahead in (8, 16, 32):
@@ -33,7 +33,7 @@ class TestBoundedParser(unittest.TestCase):
 
     def test_random_roundtrip(self):
         import random
-        rng = random.Random(0xB0UND)
+        rng = random.Random(0xB02D)
         data = bytes(rng.getrandbits(8) for _ in range(4096))
         self.assertEqual(apply_tokens(tokenize_bounded(data, lookahead=16)), data)
 
