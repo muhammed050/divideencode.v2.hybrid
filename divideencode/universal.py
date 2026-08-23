@@ -1,10 +1,11 @@
 """Content-agnostic adaptive preprocessing for DE2.
 
-The selector is intentionally extension-free. It scores generic reversible
-byte transforms by the *final DE2 size*, not by intermediate IR size.
+The selector is extension-free: it measures the final DE2 stream and keeps only
+reversible transforms that actually improve the end-to-end result.
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 
 from .de2 import compress as de2_compress, decompress as de2_decompress
@@ -19,6 +20,29 @@ class Candidate:
     ident: int
     data: bytes
     transform_size: int
+
+
+def _u(n: int) -> bytes:
+    out = bytearray()
+    while n >= 0x80:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+def _r(data: bytes, p: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while True:
+        if p >= len(data) or shift > 63:
+            raise ValueError("invalid varint")
+        b = data[p]
+        p += 1
+        value |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return value, p
+        shift += 7
 
 
 def _delta(data: bytes) -> bytes:
@@ -72,8 +96,7 @@ def _bittranspose8(data: bytes) -> bytes:
             for row in range(8):
                 value |= ((block[row] >> bit) & 1) << row
             out[off + bit] = value
-    if full != len(data):
-        out[full:] = data[full:]
+    out[full:] = data[full:]
     return bytes(out)
 
 
@@ -91,8 +114,7 @@ def _transpose16(data: bytes) -> bytes:
             base = row * 16
             for col in range(16):
                 out[off + col * 16 + row] = block[base + col]
-    if full != len(data):
-        out[full:] = data[full:]
+    out[full:] = data[full:]
     return bytes(out)
 
 
@@ -101,7 +123,6 @@ def _untranspose16(data: bytes) -> bytes:
 
 
 def _rle(data: bytes) -> bytes:
-    """Generic byte RLE: each run is encoded as count(1..255), value."""
     if not data:
         return b""
     out = bytearray()
@@ -132,32 +153,129 @@ def _unrle(data: bytes) -> bytes:
 
 
 def _shuffle_even_odd(data: bytes) -> bytes:
-    """Group even and odd source positions while preserving byte count."""
     return data[::2] + data[1::2]
 
 
 def _unshuffle_even_odd(data: bytes) -> bytes:
     n = len(data)
     even_n = (n + 1) // 2
-    evens = data[:even_n]
-    odds = data[even_n:]
     out = bytearray(n)
-    out[::2] = evens
-    out[1::2] = odds
+    out[::2] = data[:even_n]
+    out[1::2] = data[even_n:]
+    return bytes(out)
+
+
+def _char_class(x: int) -> int:
+    # Generic lexical classes; deliberately no file-format knowledge.
+    if x in (9, 10, 13, 32):
+        return 0  # whitespace
+    if 48 <= x <= 57 or 65 <= x <= 90 or 97 <= x <= 122 or x >= 128:
+        return 1  # word/text byte
+    if x < 32:
+        return 3  # control/raw
+    return 2  # punctuation/symbol
+
+
+def _lex_tokens(data: bytes) -> list[bytes]:
+    if not data:
+        return []
+    tokens: list[bytes] = []
+    start = 0
+    cls = _char_class(data[0])
+    for i in range(1, len(data)):
+        c = _char_class(data[i])
+        # Punctuation is deliberately kept as single-byte tokens. This exposes
+        # repeated structural delimiters to DE2 without assuming JSON/CSV/etc.
+        boundary = c != cls or cls == 2 or cls == 3
+        if boundary:
+            tokens.append(data[start:i])
+            start = i
+            cls = c
+    tokens.append(data[start:])
+    return tokens
+
+
+def _token_dict(data: bytes) -> bytes:
+    """Universal lexical dictionary transform.
+
+    Repeated word/text and whitespace runs become dictionary references while
+    unique tokens remain literal. The transform is lossless and format agnostic.
+    """
+    tokens = _lex_tokens(data)
+    counts = Counter(t for t in tokens if len(t) >= 3)
+    dictionary = [t for t, n in counts.items() if n >= 2]
+    # Prefer high total savings, then deterministic lexical order.
+    dictionary.sort(key=lambda t: (-(counts[t] * (len(t) - 2)), -len(t), t))
+    dictionary = dictionary[:1024]
+    ids = {t: i for i, t in enumerate(dictionary)}
+
+    out = bytearray(b"TD2")
+    out += _u(len(dictionary))
+    for token in dictionary:
+        out += _u(len(token)) + token
+    out += _u(len(tokens))
+    for token in tokens:
+        idx = ids.get(token)
+        if idx is not None:
+            out.append(1)
+            out += _u(idx)
+        else:
+            out.append(0)
+            out += _u(len(token)) + token
+    return bytes(out)
+
+
+def _untoken_dict(data: bytes) -> bytes:
+    if len(data) < 3 or data[:3] != b"TD2":
+        raise ValueError("invalid token dictionary payload")
+    p = 3
+    n, p = _r(data, p)
+    dictionary = []
+    for _ in range(n):
+        size, p = _r(data, p)
+        if p + size > len(data):
+            raise ValueError("truncated token dictionary")
+        dictionary.append(data[p:p + size])
+        p += size
+    count, p = _r(data, p)
+    out = bytearray()
+    for _ in range(count):
+        if p >= len(data):
+            raise ValueError("truncated token stream")
+        tag = data[p]
+        p += 1
+        if tag == 1:
+            idx, p = _r(data, p)
+            if idx >= len(dictionary):
+                raise ValueError("bad token dictionary reference")
+            out += dictionary[idx]
+        elif tag == 0:
+            size, p = _r(data, p)
+            if p + size > len(data):
+                raise ValueError("truncated literal token")
+            out += data[p:p + size]
+            p += size
+        else:
+            raise ValueError("unknown token stream tag")
+    if p != len(data):
+        raise ValueError("trailing token dictionary bytes")
     return bytes(out)
 
 
 def candidates(data: bytes) -> list[Candidate]:
-    """Return generic candidates; no filename/extension classification."""
+    """Return generic candidates; no extension-based routing."""
     data = bytes(data)
+    rle = _rle(data)
+    td = _token_dict(data)
     return [
         Candidate("identity", 0, data, len(data)),
         Candidate("delta8", 1, _delta(data), len(data)),
         Candidate("xor8", 2, _xor(data), len(data)),
         Candidate("bittranspose8", 3, _bittranspose8(data), len(data)),
         Candidate("transpose16", 4, _transpose16(data), len(data)),
-        Candidate("rle", 5, _rle(data), len(_rle(data))),
+        Candidate("rle", 5, rle, len(rle)),
         Candidate("even_odd", 6, _shuffle_even_odd(data), len(data)),
+        Candidate("token_dict", 7, td, len(td)),
     ]
 
 
@@ -176,6 +294,8 @@ def _inverse(ident: int, data: bytes) -> bytes:
         return _unrle(data)
     if ident == 6:
         return _unshuffle_even_odd(data)
+    if ident == 7:
+        return _untoken_dict(data)
     raise ValueError(f"unknown universal transform {ident}")
 
 
@@ -189,7 +309,7 @@ def _unpack(payload: bytes) -> tuple[int, int, bytes]:
     return payload[4], int.from_bytes(payload[5:13], "little"), payload[13:]
 
 
-def compress(data: bytes, *, max_candidates: int = 7) -> tuple[bytes, dict]:
+def compress(data: bytes, *, max_candidates: int = 8) -> tuple[bytes, dict]:
     """Select the smallest final DE2 stream among generic reversible transforms."""
     data = bytes(data)
     best_blob = None
