@@ -62,12 +62,7 @@ def _unxor(data: bytes) -> bytes:
 
 
 def _bittranspose8(data: bytes) -> bytes:
-    """Transpose bits inside every 8-byte block without changing size.
-
-    Each 8-byte block is treated as an 8x8 bit matrix. Rows are the original
-    bytes and columns become output bytes. This preserves the exact byte count
-    unlike the old one-byte-per-bit representation.
-    """
+    """Transpose bits inside every 8-byte block without changing size."""
     full = len(data) // 8 * 8
     out = bytearray(len(data))
     for off in range(0, full, 8):
@@ -83,7 +78,6 @@ def _bittranspose8(data: bytes) -> bytes:
 
 
 def _unbittranspose8(data: bytes) -> bytes:
-    # A transposed 8x8 bit matrix is inverted by the same operation.
     return _bittranspose8(data)
 
 
@@ -103,8 +97,54 @@ def _transpose16(data: bytes) -> bytes:
 
 
 def _untranspose16(data: bytes) -> bytes:
-    # Matrix transpose is an involution.
     return _transpose16(data)
+
+
+def _rle(data: bytes) -> bytes:
+    """Generic byte RLE: each run is encoded as count(1..255), value."""
+    if not data:
+        return b""
+    out = bytearray()
+    i = 0
+    n = len(data)
+    while i < n:
+        value = data[i]
+        j = i + 1
+        limit = min(n, i + 255)
+        while j < limit and data[j] == value:
+            j += 1
+        out.append(j - i)
+        out.append(value)
+        i = j
+    return bytes(out)
+
+
+def _unrle(data: bytes) -> bytes:
+    if len(data) & 1:
+        raise ValueError("invalid RLE payload")
+    out = bytearray()
+    for i in range(0, len(data), 2):
+        count = data[i]
+        if count == 0:
+            raise ValueError("invalid zero-length RLE run")
+        out.extend(bytes((data[i + 1],)) * count)
+    return bytes(out)
+
+
+def _shuffle_even_odd(data: bytes) -> bytes:
+    """Group even and odd source positions while preserving byte count."""
+    return data[::2] + data[1::2]
+
+
+def _unshuffle_even_odd(data: bytes) -> bytes:
+    n = len(data)
+    even_n = (n + 1) // 2
+    evens = data[:even_n]
+    odds = data[even_n:]
+    out = bytearray(n)
+    out[::2] = evens
+    out[1::2] = odds
+    return bytes(out)
 
 
 def candidates(data: bytes) -> list[Candidate]:
@@ -116,6 +156,8 @@ def candidates(data: bytes) -> list[Candidate]:
         Candidate("xor8", 2, _xor(data), len(data)),
         Candidate("bittranspose8", 3, _bittranspose8(data), len(data)),
         Candidate("transpose16", 4, _transpose16(data), len(data)),
+        Candidate("rle", 5, _rle(data), len(_rle(data))),
+        Candidate("even_odd", 6, _shuffle_even_odd(data), len(data)),
     ]
 
 
@@ -130,6 +172,10 @@ def _inverse(ident: int, data: bytes) -> bytes:
         return _unbittranspose8(data)
     if ident == 4:
         return _untranspose16(data)
+    if ident == 5:
+        return _unrle(data)
+    if ident == 6:
+        return _unshuffle_even_odd(data)
     raise ValueError(f"unknown universal transform {ident}")
 
 
@@ -143,7 +189,7 @@ def _unpack(payload: bytes) -> tuple[int, int, bytes]:
     return payload[4], int.from_bytes(payload[5:13], "little"), payload[13:]
 
 
-def compress(data: bytes, *, max_candidates: int = 5) -> tuple[bytes, dict]:
+def compress(data: bytes, *, max_candidates: int = 7) -> tuple[bytes, dict]:
     """Select the smallest final DE2 stream among generic reversible transforms."""
     data = bytes(data)
     best_blob = None
