@@ -1,8 +1,10 @@
 """UBIR5 — universal phrase/token translator for DE2.
 
-Fast path: one-pass fixed-window counting, cheap gain ranking, then a single
-materialization pass. The representation is reversible and may grow; DE2
-chooses whether it is useful.
+The selector deliberately estimates *actual* token savings instead of relying
+on overlapping substring counts. A phrase reference costs two bytes, while a
+dictionary entry costs its phrase bytes plus two bytes of length metadata.
+This keeps the phrase IR from selecting patterns that look frequent but do
+not survive the longest-first tokenization pass.
 """
 from __future__ import annotations
 
@@ -21,44 +23,68 @@ class PhraseCandidate:
     gain: int
 
 
-def _candidate_phrases(src: bytes, lengths: tuple[int, ...], max_dict: int) -> list[PhraseCandidate]:
-    """Find useful phrases without repeatedly scanning the source.
+def _nonoverlap_count(data: bytes, phrase: bytes) -> int:
+    """Count occurrences exactly as the token stream can consume them.
 
-    The old selector called ``bytes.find`` for every candidate and then rebuilt
-    a temporary ``working`` byte string after every dictionary selection. That
-    made preparation roughly O(candidates * input). We now rank candidates
-    using one Counter pass per length and leave exact overlap handling to the
-    final tokenization pass.
+    ``bytes.count`` is implemented in C and counts non-overlapping matches,
+    which is a good cheap proxy for the longest-first tokenizer.
+    """
+    return data.count(phrase)
+
+
+def _candidate_phrases(src: bytes, lengths: tuple[int, ...], max_dict: int) -> list[PhraseCandidate]:
+    """Find candidates using frequency first, then exact token savings.
+
+    Counting every source position is still done only once per phrase length.
+    We then re-score a bounded shortlist with ``bytes.count`` so overlapping
+    occurrences cannot inflate the estimated benefit.
     """
     sample = src if len(src) <= 8 * 1024 * 1024 else src[:8 * 1024 * 1024]
-    candidates: list[PhraseCandidate] = []
+    rough: list[tuple[bytes, int, int]] = []
+    per_length = max(32, min(max_dict * 2, 256))
+
     for length in lengths:
         if length > len(sample):
             continue
         counts = Counter(sample[i:i + length] for i in range(len(sample) - length + 1))
-        for phrase, freq in counts.most_common(max_dict * 2):
+        for phrase, freq in counts.most_common(per_length):
             if freq < 2:
                 break
-            gain = freq * (length - 2) - length
-            if gain > 0:
-                candidates.append(PhraseCandidate(phrase, freq, gain))
+            # Upper-bound screening; exact non-overlap scoring follows.
+            rough_gain = freq * (length - 2) - (length + 2)
+            if rough_gain > 0:
+                rough.append((phrase, freq, rough_gain))
+
+    # Bound the expensive C-level count calls while keeping representation
+    # diversity across phrase lengths.
+    rough.sort(key=lambda x: (x[2], x[1], len(x[0])), reverse=True)
+    shortlist = rough[: min(max_dict * 2, 256)]
+
+    candidates: list[PhraseCandidate] = []
+    for phrase, freq, _ in shortlist:
+        actual = _nonoverlap_count(sample, phrase)
+        length = len(phrase)
+        gain = actual * (length - 2) - (length + 2)
+        if gain > 0:
+            candidates.append(PhraseCandidate(phrase, actual, gain))
+
     candidates.sort(key=lambda x: (x.gain, x.count, len(x.phrase)), reverse=True)
     return candidates[: max_dict * 4]
 
 
 def _select_dictionary(src: bytes, lengths: tuple[int, ...], max_dict: int) -> list[bytes]:
-    """Select a compact non-redundant dictionary using estimated gains.
+    """Select a compact dictionary from exact non-overlap savings.
 
-    Exact occurrence rescans are deliberately avoided here. Overlap is handled
-    naturally by the longest-first token matcher below, which is both faster and
-    gives a deterministic result.
+    Substring redundancy is avoided because the tokenizer is longest-first;
+    keeping both a phrase and a strict substring usually adds dictionary
+    overhead without adding useful coverage.
     """
     selected: list[bytes] = []
     for cand in _candidate_phrases(src, lengths, max_dict):
         if len(selected) >= max_dict:
             break
         p = cand.phrase
-        if any(p in q or q in p for q in selected):
+        if any(p == q or (len(p) <= len(q) and p in q) for q in selected):
             continue
         selected.append(p)
     return selected
@@ -123,10 +149,10 @@ def _decode_tokens(tokens: bytes, dictionary: list[bytes]) -> bytes:
 
 def encode(src: bytes, *, phrase_lengths: tuple[int, ...] = (4, 5, 6, 8, 12, 16), max_dict: int = 255) -> tuple[bytes, list[bytes]]:
     src = bytes(src)
+    if max_dict < 0 or max_dict > 255:
+        raise ValueError("max_dict must be between 0 and 255")
     dictionary = _select_dictionary(src, phrase_lengths, max_dict)
     tokens = _encode_tokens(src, dictionary)
-    if len(dictionary) > 255:
-        raise ValueError("UBIR5 dictionary overflow")
     header = bytearray(MAGIC)
     header.append(VERSION)
     header.append(len(dictionary))
