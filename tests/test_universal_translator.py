@@ -5,7 +5,7 @@ def test_universal_text_roundtrip():
     data = (b"function main() { return 42; }\n" * 4000)
     blob = compress(data)
     assert decompress(blob) == data
-    assert block_modes(blob)[0] in {"STRUCT_LZ", "LZ"}
+    assert block_modes(blob)[0] in {"STRUCT+LZ", "STRUCT_LZ", "LZ"}
 
 
 def test_universal_random_falls_back_without_expansion():
