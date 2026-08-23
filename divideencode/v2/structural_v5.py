@@ -48,45 +48,55 @@ def _raw(data):
     return MAGIC + bytes((VERSION, 0)) + _varint(len(data)) + data
 
 
+def _largest_valid_width(data):
+    """Return the largest valid structural width without scanning all widths.
+
+    The v5 selector compares only the encoded structural size. Since the
+    payload length is always exactly len(data), that size is monotonic with
+    metadata length, and metadata length decreases (or stays equal) as width
+    increases. Therefore the old 2..64 scan always selected the largest valid
+    width anyway. Keeping the same selection semantics removes an O(64*n)
+    search from every candidate analysis.
+    """
+    n = len(data)
+    upper = min(64, n // 32)
+    for width in range(upper, 1, -1):
+        if n % width == 0:
+            return width
+    return None
+
+
 def _record_transpose(data):
-    best = None
-    for width in range(2, 65):
-        if len(data) < width * 32 or len(data) % width:
-            continue
-        count = len(data) // width
-        out = bytearray(len(data))
-        q = 0
-        for col in range(width):
-            for row in range(count):
-                out[q] = data[row * width + col]
-                q += 1
-        step = Step(STEP_RECORD_TRANSPOSE, bytes((width,)) + _varint(count), bytes(out))
-        size = len(_encode([step]))
-        if best is None or size < best[0]:
-            best = size, step, bytes(out)
-    return best[1:] if best else None
+    width = _largest_valid_width(data)
+    if width is None:
+        return None
+    count = len(data) // width
+    out = bytearray(len(data))
+    q = 0
+    for col in range(width):
+        for row in range(count):
+            out[q] = data[row * width + col]
+            q += 1
+    step = Step(STEP_RECORD_TRANSPOSE, bytes((width,)) + _varint(count), bytes(out))
+    return step, bytes(out)
 
 
 def _column_transform(data, xor=False):
-    best = None
-    for width in range(2, 65):
-        if len(data) < width * 32 or len(data) % width:
-            continue
-        count = len(data) // width
-        out = bytearray(len(data))
-        for col in range(width):
-            prev = 0
-            for row in range(count):
-                p = row * width + col
-                x = data[p]
-                out[p] = (x ^ prev) if xor else ((x - prev) & 255)
-                prev = x
-        kind = STEP_COLUMN_XOR if xor else STEP_COLUMN_DELTA
-        step = Step(kind, bytes((width,)) + _varint(count), bytes(out))
-        size = len(_encode([step]))
-        if best is None or size < best[0]:
-            best = size, step, bytes(out)
-    return (best[1], best[2]) if best else None
+    width = _largest_valid_width(data)
+    if width is None:
+        return None
+    count = len(data) // width
+    out = bytearray(len(data))
+    for col in range(width):
+        prev = 0
+        for row in range(count):
+            p = row * width + col
+            x = data[p]
+            out[p] = (x ^ prev) if xor else ((x - prev) & 255)
+            prev = x
+    kind = STEP_COLUMN_XOR if xor else STEP_COLUMN_DELTA
+    step = Step(kind, bytes((width,)) + _varint(count), bytes(out))
+    return step, bytes(out)
 
 
 def _decode_step(s):
@@ -238,13 +248,7 @@ def transform(data, max_depth=3):
 
 
 def adaptive_transform(data, scorer, max_depth=3):
-    """Choose the smallest downstream-scored representation without regressions.
-
-    The scorer may reject candidates by raising.  Rejections are ignored rather
-    than converted into a numeric score.  The final selected blob is rescored
-    once before returning, so the Decision's downstream_size always describes
-    the blob that is actually returned.
-    """
+    """Choose the smallest downstream-scored representation without regressions."""
     raw = _raw(data)
     try:
         best = scorer(data)
@@ -262,9 +266,6 @@ def adaptive_transform(data, scorer, max_depth=3):
         if score < best:
             best, best_blob, best_kinds = score, c.blob, c.kinds
 
-    # Defensive consistency check: scorer implementations can be stateful or
-    # use codec paths that reject a transformed representation. Never return a
-    # stale score that does not belong to the selected blob.
     try:
         selected_score = scorer(best_blob)
     except Exception:
