@@ -1,0 +1,9 @@
+# Core divideencode / divideencode.v2 library: stdlib only, no dependencies.
+# The packages below are only needed to run benchmarks/ comparisons against
+# other compressors; they are not imported by the library itself.
+
+brotli>=1.1.0
+zstandard>=0.22.0
+
+# pytest is only needed to run the test suite:
+pytest>=7.0
