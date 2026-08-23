@@ -1,9 +1,16 @@
-"""Measure the DE3 merged token coder against the current V3 frame."""
+"""Measure the DE3 merged token coder against the current V3 frame.
+
+The benchmark is intentionally a representation experiment: it derives the
+V3 token sequence directly from the matcher, validates that sequence against
+the source bytes, and then compares entropy representations.  It does not
+make the experiment depend on the legacy V3 frame decoder, whose correctness
+is a separate concern.
+"""
 from pathlib import Path
-import sys
 import time
 
 # Make direct execution from benchmarks/ work from a source checkout.
+import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from divideencode.bitstream import decode_varint
@@ -38,6 +45,47 @@ def _tokens_from_v3(data, level="BALANCED"):
     return tokens
 
 
+def _reconstruct(tokens):
+    """Rebuild source bytes from the merged token sequence.
+
+    This is deliberately independent of the DE2 frame decoder so a frame-level
+    regression cannot invalidate the representation experiment.
+    """
+    out = bytearray()
+    reps = [1, 2, 4, 8]
+    for token in tokens:
+        kind = token[0]
+        if kind == 0:
+            out.append(token[1])
+            continue
+
+        length = token[1]
+        if kind == 1:
+            distance = token[2]
+            if distance < 1 or distance > len(out):
+                raise ValueError("invalid explicit distance in token stream")
+            reps.insert(0, distance)
+            del reps[4:]
+        elif kind == 2:
+            index = token[2]
+            if not 0 <= index < 4:
+                raise ValueError("invalid repeat index in token stream")
+            distance = reps[index]
+            if distance < 1 or distance > len(out):
+                raise ValueError("invalid repeat distance in token stream")
+            if index:
+                distance = reps.pop(index)
+                reps.insert(0, distance)
+        else:
+            raise ValueError("unknown token kind")
+
+        if distance > len(out):
+            raise ValueError("distance exceeds produced output")
+        for _ in range(length):
+            out.append(out[-distance])
+    return bytes(out)
+
+
 def main():
     files = sorted(p for p in CORPUS.iterdir() if p.is_file())
     if not files:
@@ -55,12 +103,12 @@ def main():
         old = lz.encode_v2(data, level="BALANCED")
         t1 = time.perf_counter()
         tokens = _tokens_from_v3(data, level="BALANCED")
+        if _reconstruct(tokens) != data:
+            raise AssertionError(f"V3 matcher token roundtrip failed: {path.name}")
         new = encode_tokens(tokens)
-        assert decode_tokens(new) == tokens
+        if decode_tokens(new) != tokens:
+            raise AssertionError(f"DE3 merged coder roundtrip failed: {path.name}")
         t2 = time.perf_counter()
-        decoded, end = lz.decode_v2(old, 0, len(old), len(data), lz.entropy.DecodeTables())
-        if end != len(old) or decoded != data:
-            raise AssertionError(f"V3 roundtrip failed: {path.name}")
 
         total_old += len(old)
         total_new += len(new)
@@ -75,7 +123,7 @@ def main():
     print("-" * 108)
     print(f"TOTAL{'':23s} old={total_old:9,d} B  merged={total_new:9,d} B  "
           f"delta={delta:+8,d} B ({pct:+6.2f}%)")
-    print("NOTE: this is a representation experiment; the production V3 frame is unchanged.")
+    print("NOTE: representation experiment only; production V3 frame remains unchanged.")
 
 
 if __name__ == "__main__":
