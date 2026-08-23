@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import gzip
 import lzma
+import os
+import sys
 import time
 import zlib
+
+# Allow `python benchmarks\standard_comparison.py` from the repository root.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 import brotli
 import zstandard as zstd
