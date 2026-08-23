@@ -73,7 +73,7 @@ class TestDe2Modes(unittest.TestCase):
     def _mode_of(self, data):
         from divideencode.de2.container import parse_header, iter_blocks
         blob = de2.compress(data)
-        _t, count, pos = parse_header(blob)
+        _t, count, _flags, pos = parse_header(blob)
         blocks = list(iter_blocks(blob, pos, len(blob), count,
                                   len(data)))
         return blocks[0][0].mode
@@ -151,7 +151,7 @@ class TestDe2Corruption(unittest.TestCase):
         self._reject(self.blob + b"GARBAGE")
 
     def test_bad_magic_version_flags(self):
-        for pos, val in ((0, ord("X")), (3, 9), (4, 0x01)):
+        for pos, val in ((0, ord("X")), (3, 9), (4, 0x80)):
             m = bytearray(self.blob)
             if pos == 0:
                 m[0:3] = b"XXX"

@@ -32,11 +32,15 @@ MAGIC = b"DE2"
 VERSION = 1
 
 
-def write_header(orig_total, block_count):
+FLAG_LZ_V2 = 0x01               # LZ blocks carry v2 frames (structured
+                                # distance alphabet); legacy otherwise
+
+
+def write_header(orig_total, block_count, flags=0):
     out = bytearray()
     out += MAGIC
     out.append(VERSION)
-    out.append(0)  # flags
+    out.append(flags)
     out += encode_varint(orig_total)
     out += encode_varint(block_count)
     crc = zlib.crc32(bytes(out)) & 0xFFFFFFFF
@@ -52,7 +56,7 @@ def parse_header(blob):
         raise NotDivideEncodedError(
             "unsupported DE2 version %d" % version)
     flags = blob[4]
-    if flags != 0:
+    if flags & ~FLAG_LZ_V2:
         raise NotDivideEncodedError("unknown DE2 flags 0x%02x" % flags)
     end = len(blob)
     orig_total, pos = decode_varint(blob, 5, end)
@@ -62,7 +66,7 @@ def parse_header(blob):
     stored_crc = int.from_bytes(blob[pos:pos + 4], "little")
     if zlib.crc32(blob[:pos]) & 0xFFFFFFFF != stored_crc:
         raise CorruptedError("DE2 header crc mismatch")
-    return orig_total, block_count, pos + 4
+    return orig_total, block_count, flags, pos + 4
 
 
 class BlockHeader:

@@ -121,7 +121,7 @@ def delta_encode(data, w=4, zigzag=True):
         b"D" + bytes((WORD_SIZES.index(w), 1 if zigzag else 0))
 
 
-def numeric_encode(data, mono=None, hi_gain=None):
+def numeric_encode(data, mono=None, hi_gain=None, _enc=None):
     """Bounded multi-candidate numeric pre-transform (M4/M5).
 
     Tries zigzag-delta widths from a feature-ranked candidate order
@@ -131,7 +131,13 @@ def numeric_encode(data, mono=None, hi_gain=None):
     rule stops as soon as a frame lands under 2% of the input --
     no realistic competitor beats that by enough to pay for another
     encode. Returns (frame, tmeta).
+
+    _enc selects the LZ frame codec (defaults to the legacy v1 frame;
+    the container passes lz.encode_v2 so payload frames match the
+    container's FLAG_LZ_V2 contract).
     """
+    if _enc is None:
+        _enc = lz.encode
     if hi_gain is not None and hi_gain >= 2.0:
         order = (1, 4, 2)     # byte-delta exposes LCG-style structure
     elif mono is not None and mono >= 0.85:
@@ -145,7 +151,7 @@ def numeric_encode(data, mono=None, hi_gain=None):
     best_tmeta = None
     best_w = None
     for w in order:
-        frame = lz.encode(_delta_core(data, w, True))
+        frame = _enc(_delta_core(data, w, True))
         if best_frame is None or len(frame) < len(best_frame):
             best_frame = frame
             best_tmeta = b"D" + bytes((WORD_SIZES.index(w), 1))
@@ -154,7 +160,7 @@ def numeric_encode(data, mono=None, hi_gain=None):
             return best_frame, best_tmeta
     if best_w >= 2:
         transformed = _delta_core(data, best_w, True)
-        frame = lz.encode(_plane_split(transformed, best_w))
+        frame = _enc(_plane_split(transformed, best_w))
         if len(frame) < len(best_frame):
             best_frame = frame
             best_tmeta = b"C" + bytes((WORD_SIZES.index(best_w), 1,

@@ -1,4 +1,4 @@
-"""DE2 "Fast HYB" compression engine (V2).
+"""DE2 "Fast HYB" compression engine (V2/V3).
 
 Pipeline per block:
     scan_features -> classify -> ONE transform -> LZ/TSE core ->
@@ -8,6 +8,10 @@ Public API:
     compress(data, block_size=262144)  -> DE2 container bytes
     decompress(blob, verify=True)      -> original bytes
 
+Containers written by this module set FLAG_LZ_V2: MODE_LZ / MODE_DELTA_LZ
+payloads carry v2 frames with a structured distance alphabet (see
+lz.encode_v2). Legacy flags=0 containers (v1 frames) still decode.
+
 V1 is untouched and remains fully functional.
 """
 from ..errors import CorruptedError
@@ -16,8 +20,9 @@ from ..patterns import rle_encode, rle_decode
 from . import container, entropy, lz, transforms
 from .classifier import (MODE_RAW, MODE_RLE, MODE_LZ, MODE_DELTA_LZ,
                          MODE_STRUCT_LZ, classify)
-from .container import (MAGIC, VERSION, parse_header, iter_blocks,
-                        write_header, write_block, check_block_crc)
+from .container import (MAGIC, VERSION, FLAG_LZ_V2, parse_header,
+                        iter_blocks, write_header, write_block,
+                        check_block_crc)
 from .features import scan_features
 
 DEFAULT_BLOCK_SIZE = 262144   # 256 KiB
@@ -43,13 +48,13 @@ def _encode_block(data, max_chain=lz.MAX_CHAIN, lazy=lz.LAZY, level=None):
 
     if mode == MODE_DELTA_LZ:
         frame, tmeta = transforms.numeric_encode(
-            data, mono=fs.mono32, hi_gain=fs.delta_ratio)
+            data, mono=fs.mono32, hi_gain=fs.delta_ratio, _enc=lz.encode_v2)
         payload = frame
         # fall through to size check with the ORIGINAL data length
 
     if mode == MODE_LZ and payload is None:
-        payload = lz.encode(data, max_chain=max_chain, lazy=lazy,
-                            level=level)
+        payload = lz.encode_v2(data, max_chain=max_chain, lazy=lazy,
+                               level=level)
 
     # RAW fallback rule: never expand a block
     if payload is None or len(payload) >= len(data):
@@ -78,7 +83,7 @@ def compress(data, block_size=DEFAULT_BLOCK_SIZE, max_chain=lz.MAX_CHAIN,
                              level=level)
         blocks.append(blob)
     out = bytearray()
-    out += write_header(n, len(blocks))
+    out += write_header(n, len(blocks), flags=FLAG_LZ_V2)
     for b in blocks:
         out += b
     return bytes(out)
@@ -86,16 +91,17 @@ def compress(data, block_size=DEFAULT_BLOCK_SIZE, max_chain=lz.MAX_CHAIN,
 
 def block_modes(blob):
     """Introspection: list of mode names, one per block."""
-    _orig_total, block_count, pos = parse_header(blob)
+    _orig_total, block_count, _flags, pos = parse_header(blob)
     return [container.MODE_NAMES.get(h.mode, str(h.mode))
             for h, _c in iter_blocks(blob, pos, len(blob), block_count,
                                      _orig_total)]
 
 
 def decompress(blob, verify=True):
-    orig_total, block_count, pos = parse_header(blob)
+    orig_total, block_count, flags, pos = parse_header(blob)
     end = len(blob)
     tables = entropy.DecodeTables()
+    frame_decode = lz.decode_v2 if (flags & FLAG_LZ_V2) else lz.decode
     parts = []
     produced = 0
     for header, crc in iter_blocks(blob, pos, end, block_count, orig_total):
@@ -109,9 +115,11 @@ def decompress(blob, verify=True):
         elif mode == MODE_RLE:
             data, _p = rle_decode(payload, 0, len(payload), raw_len)
         elif mode == MODE_LZ:
-            data, _p = lz.decode(payload, 0, len(payload), raw_len, tables)
+            data, _p = frame_decode(payload, 0, len(payload), raw_len,
+                                    tables)
         elif mode == MODE_DELTA_LZ:
-            inner, _p = lz.decode(payload, 0, len(payload), raw_len, tables)
+            inner, _p = frame_decode(payload, 0, len(payload), raw_len,
+                                     tables)
             data = transforms.transform_decode(inner, header.tmeta, raw_len)
             if len(data) != raw_len:
                 raise CorruptedError("delta produced wrong block size")

@@ -38,6 +38,11 @@ CHAIN_HARD_LIMIT = 256           # legacy constant, unused by the v3 encoder
 M32 = 0xFFFFFFFF
 _KNUTH = 0x9E3779B1              # multiplicative hash constant
 
+# shared encoder/decoder REP0..3 initial distances (MRU order).
+# WARNING: both sides MUST use this exact tuple or rep-coded streams
+# decode to wrong data (the format has no field to renegotiate it).
+REP_INIT = (1, 2, 4, 8)
+
 # level -> knobs; budget_floor bounds the adaptive probe budget
 # (floor == max_chain disables shrinking: BALANCED/MAX always search deep)
 _LEVEL_FAST = dict(max_chain=6, lazy=False, nice_len=24, good_len=8,
@@ -62,11 +67,19 @@ def _match_length(data, a, b, limit):
 
 def encode(data, window=DEFAULT_WINDOW, max_chain=MAX_CHAIN, lazy=LAZY,
            level=None):
-    """bytes -> DE2 LZ frame (separated streams, see module docstring).
+    """bytes -> DE2 LZ frame v1 (separated streams, see module docstring).
 
     level: "FAST" | "BALANCED" | "MAX". Explicit max_chain/lazy kwargs
     override the level table (legacy API preserved).
     """
+    num_matches, literals, ll_out, ml_out, dist_out = _tokenize(
+        data, window=window, max_chain=max_chain, lazy=lazy, level=level)
+    return _frame(num_matches, literals, ll_out, ml_out, dist_out)
+
+
+def _tokenize(data, window=DEFAULT_WINDOW, max_chain=MAX_CHAIN, lazy=LAZY,
+              level=None):
+    """Shared tokenizer: bytes -> (num_matches, literals, ll, ml, dist)."""
     if level is not None:
         try:
             cfg = LEVELS[level]
@@ -88,11 +101,11 @@ def encode(data, window=DEFAULT_WINDOW, max_chain=MAX_CHAIN, lazy=LAZY,
     ml_out = bytearray()
     dist_out = bytearray()
     num_matches = 0
-    r0, r1, r2, r3 = 1, 2, 4, 8     # rep0..rep3 distances (MRU)
+    r0, r1, r2, r3 = REP_INIT     # rep0..rep3 distances (MRU)
     nm = MIN_MATCH
 
     if n == 0:
-        return _frame(num_matches, literals, ll_out, ml_out, dist_out)
+        return (num_matches, literals, ll_out, ml_out, dist_out)
 
     # ---- hash structures: flat head table + prev chain array ----
     hb = n.bit_length()
@@ -281,7 +294,7 @@ def encode(data, window=DEFAULT_WINDOW, max_chain=MAX_CHAIN, lazy=LAZY,
 
     literals += data[lit_start:]
 
-    return _frame(num_matches, literals, ll_out, ml_out, dist_out)
+    return (num_matches, literals, ll_out, ml_out, dist_out)
 
 
 def _frame(num_matches, literals, ll_out, ml_out, dist_out):
@@ -296,6 +309,217 @@ def _frame(num_matches, literals, ll_out, ml_out, dist_out):
     frame += _wv(len(dist_out))
     frame += entropy.encode_stream(bytes(dist_out))
     return bytes(frame)
+
+
+# ------------------------------------------------------------ v2 frames ---
+# Distance alphabet (structured, deflate/zstd-style):
+#     symbol 0..3   -> rep0..rep3, no extra bits
+#     symbol s>=4   -> explicit distance d: nb = s - 3 is the bit length
+#                      of d (nb >= 1); the low (nb - 1) bits of d follow
+#                      as extra bits (leading bit implied).
+# Symbols are Huffman-coded in their own stream; extra bits accumulate
+# MSB-first into a separate byte slice. A 2-byte varint (<= 14 info bits)
+# becomes ~7-9 coded bits for typical mid-range distances.
+
+def _dist_split(dists_bytes):
+    """v1 dist varint bytes -> (dsym bytes, extra-bits bytes)."""
+    dsyms = bytearray()
+    xbits = bytearray()
+    cur = 0
+    nbits = 0
+    p = 0
+    endn = len(dists_bytes)
+    while p < endn:
+        e, p = _rv(dists_bytes, p, endn)
+        if e <= 3:
+            dsyms.append(e)
+            continue
+        d = e - 3                     # explicit distance, d >= 1
+        nb = d.bit_length()
+        dsyms.append(nb + 3)
+        if nb > 1:
+            cur = (cur << (nb - 1)) | (d & ((1 << (nb - 1)) - 1))
+            nbits += nb - 1
+            while nbits >= 8:
+                nbits -= 8
+                xbits.append((cur >> nbits) & 0xFF)
+            cur &= (1 << nbits) - 1
+    if nbits:
+        xbits.append((cur << (8 - nbits)) & 0xFF)
+    return bytes(dsyms), bytes(xbits)
+
+
+def encode_v2(data, window=DEFAULT_WINDOW, max_chain=MAX_CHAIN, lazy=LAZY,
+              level=None):
+    """v2 frame: same tokenizer, structured distance coding."""
+    nm, literals, ll_raw, ml_raw, dist_raw = _tokenize(
+        data, window=window, max_chain=max_chain, lazy=lazy, level=level)
+    dsyms, xbits = _dist_split(bytes(dist_raw))
+
+    out = bytearray()
+    out += _wv(nm)
+    out += _wv(len(literals))
+    out += entropy.encode_stream(bytes(literals))
+    out += _wv(len(ll_raw))
+    out += entropy.encode_stream(bytes(ll_raw))
+    out += _wv(len(ml_raw))
+    out += entropy.encode_stream(bytes(ml_raw))
+    out += _wv(len(dsyms))
+    out += entropy.encode_stream(dsyms)
+    out += _wv(len(xbits))
+    out += xbits
+    return bytes(out)
+
+
+def decode_v2(blob, pos, end, raw_len, tables):
+    """Decode a v2 LZ frame. Returns (data, new_pos)."""
+    num_matches, pos = _rv(blob, pos, end)
+    lit_count, pos = _rv(blob, pos, end)
+    literals, pos = entropy.decode_stream(blob, pos, end, lit_count, tables)
+
+    ll_buf = ml_buf = ds_buf = None
+    for target in range(3):
+        slen, pos = _rv(blob, pos, end)
+        sblob, pos = entropy.decode_stream(blob, pos, end, slen, tables)
+        if target == 0:
+            ll_buf, ll_end = sblob, slen
+        elif target == 1:
+            ml_buf, ml_end = sblob, slen
+        else:
+            ds_buf, ds_end = sblob, slen
+    xlen, pos = _rv(blob, pos, end)
+    if xlen > end - pos:
+        raise CorruptedError("lz extra-bits truncated")
+    x_end = pos + xlen
+    if x_end != end:
+        raise CorruptedError("lz frame has excess data")
+
+    out = bytearray()
+    r0, r1, r2, r3 = REP_INIT
+    li = 0
+    p_ll = p_ml = p_ds = 0
+    xp = pos                       # cursor into extra-bits region
+    acc = 0                        # MSB-first extra-bit accumulator
+    nacc = 0
+
+    for _ in range(num_matches):
+        # literal length varint (inline, 1-byte fast path)
+        if p_ll < ll_end:
+            v = ll_buf[p_ll]
+            p_ll += 1
+            if v > 127:
+                v &= 127
+                shift = 7
+                while True:
+                    if p_ll >= ll_end:
+                        raise CorruptedError("truncated varint")
+                    b = ll_buf[p_ll]
+                    p_ll += 1
+                    v |= (b & 127) << shift
+                    if b < 128:
+                        break
+                    shift += 7
+                    if shift > 56:
+                        raise CorruptedError("varint overflow")
+            ll = v
+        else:
+            raise CorruptedError("truncated literal-length stream")
+        # match length varint
+        if p_ml < ml_end:
+            v = ml_buf[p_ml]
+            p_ml += 1
+            if v > 127:
+                v &= 127
+                shift = 7
+                while True:
+                    if p_ml >= ml_end:
+                        raise CorruptedError("truncated varint")
+                    b = ml_buf[p_ml]
+                    p_ml += 1
+                    v |= (b & 127) << shift
+                    if b < 128:
+                        break
+                    shift += 7
+                    if shift > 56:
+                        raise CorruptedError("varint overflow")
+            ml = v + MIN_MATCH
+        else:
+            raise CorruptedError("truncated match-length stream")
+        # distance symbol
+        if p_ds < ds_end:
+            s = ds_buf[p_ds]
+            p_ds += 1
+        else:
+            raise CorruptedError("truncated distance-symbol stream")
+
+        if ll:
+            if li + ll > lit_count:
+                raise CorruptedError("lz literal run exceeds pool")
+            out += literals[li:li + ll]
+            li += ll
+        olen = len(out)
+
+        if s <= 3:
+            if s == 0:
+                d = r0
+            elif s == 1:
+                d = r1
+                r1, r0 = r0, r1
+            elif s == 2:
+                d = r2
+                r2, r1, r0 = r1, r0, r2
+            else:
+                d = r3
+                r3, r2, r1, r0 = r2, r1, r0, r3
+            if d < 1 or d > olen:
+                raise CorruptedError("lz invalid repeat distance")
+        else:
+            nb = s - 3
+            if nb < 1 or nb > 25:
+                raise CorruptedError("lz invalid distance symbol")
+            extra = nb - 1
+            if extra:
+                while nacc < extra:
+                    if xp >= x_end:
+                        raise CorruptedError("lz extra bits exhausted")
+                    acc = (acc << 8) | blob[xp]
+                    xp += 1
+                    nacc += 8
+                d = ((1 << (nb - 1)) |
+                     ((acc >> (nacc - extra)) & ((1 << extra) - 1)))
+                nacc -= extra
+                acc &= (1 << nacc) - 1
+            else:
+                d = 1
+            if d > olen:
+                raise CorruptedError("lz invalid distance")
+            r3, r2, r1, r0 = r2, r1, r0, d
+
+        if olen + ml > raw_len:
+            raise CorruptedError("lz overrun of block size")
+        src = olen - d
+        if d >= ml:
+            out += out[src:src + ml]
+        else:
+            # overlap-safe exponential copy: O(log ml) appends
+            while True:
+                chunk = d if d < ml else ml
+                out += out[len(out) - d:len(out) - d + chunk]
+                ml -= chunk
+                if ml <= 0:
+                    break
+                d += d
+
+    if li > lit_count:
+        raise CorruptedError("lz literal pool not fully consumed")
+    if p_ll != ll_end or p_ml != ml_end or p_ds != ds_end:
+        raise CorruptedError("lz stream has unconsumed bytes")
+    if xp != x_end and num_matches:
+        raise CorruptedError("lz extra bits not fully consumed")
+    out += literals[li:]
+    if len(out) != raw_len:
+        raise CorruptedError("lz produced wrong block size")
+    return bytes(out), pos
 
 
 def decode(blob, pos, end, raw_len, tables):
@@ -321,7 +545,7 @@ def decode(blob, pos, end, raw_len, tables):
         raise CorruptedError("lz frame has excess data")
 
     out = bytearray()
-    r0, r1, r2, r3 = 1, 2, 4, 8
+    r0, r1, r2, r3 = REP_INIT
     li = 0
     p_ll = p_ml = p_d = 0
     for _ in range(num_matches):
