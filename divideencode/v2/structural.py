@@ -22,6 +22,8 @@ MAGIC = b"SD1"
 
 
 def _varint(n: int) -> bytes:
+    if n < 0:
+        raise ValueError("negative structural varint")
     out = bytearray()
     while n >= 0x80:
         out.append((n & 0x7f) | 0x80)
@@ -36,7 +38,8 @@ def _read_varint(buf: bytes, p: int):
     while True:
         if p >= len(buf) or shift > 63:
             raise ValueError("invalid structural varint")
-        b = buf[p]; p += 1
+        b = buf[p]
+        p += 1
         n |= (b & 0x7f) << shift
         if not (b & 0x80):
             return n, p
@@ -59,7 +62,7 @@ def _undelta(values):
 
 
 def _encode_svarint(x: int) -> bytes:
-    # Zigzag + varint
+    # Zigzag + varint.
     return _varint((x << 1) ^ (x >> 63))
 
 
@@ -76,18 +79,19 @@ def _decode_svarints(buf: bytes, count: int):
 
 def _numeric_sequence(data: bytes):
     """Detect fixed-width little/big endian integer arrays and return values."""
-    for width, fmt in ((1, "B"), (2, "<H"), (4, "<I"), (8, "<Q"),
-                       (2, ">H"), (4, ">I"), (8, ">Q")):
+    for width, fmt in (
+        (1, "B"),
+        (2, "<H"), (4, "<I"), (8, "<Q"),
+        (2, ">H"), (4, ">I"), (8, ">Q"),
+    ):
         if len(data) < width * 4 or len(data) % width:
             continue
-        f = fmt if width == 1 else fmt
         try:
-            vals = list(struct.iter_unpack(f if width == 1 else f, data))
+            vals = [x[0] for x in struct.iter_unpack(fmt, data)]
         except struct.error:
             continue
-        vals = [x[0] for x in vals]
         if len(vals) >= 4:
-            yield width, f, vals
+            yield width, fmt, vals
 
 
 def _delta_candidate(data: bytes):
@@ -95,8 +99,10 @@ def _delta_candidate(data: bytes):
     for width, fmt, vals in _numeric_sequence(data):
         ds = _signed_delta(vals)
         packed = b"".join(_encode_svarint(x) for x in ds)
-        meta = bytes((width,)) + fmt.encode("ascii") + _varint(len(vals))
-        total = len(MAGIC) + 1 + len(meta) + len(packed)
+        # Self-delimiting metadata: width | format-length | format | count.
+        fmt_bytes = fmt.encode("ascii")
+        meta = bytes((width, len(fmt_bytes))) + fmt_bytes + _varint(len(vals))
+        total = len(MAGIC) + 1 + len(_varint(len(meta))) + len(meta) + len(packed)
         if total < len(data):
             c = Candidate("delta", packed, meta, total)
             if best is None or c.score < best.score:
@@ -187,28 +193,62 @@ def inverse(blob: bytes) -> bytes:
     if kind == 0:
         return blob[4:]
     mlen, p = _read_varint(blob, 4)
-    meta = blob[p:p + mlen]
-    payload = blob[p + mlen:]
+    end_meta = p + mlen
+    if end_meta > len(blob):
+        raise ValueError("truncated structural metadata")
+    meta = blob[p:end_meta]
+    payload = blob[end_meta:]
+
     if kind == 1:
+        if len(meta) < 2:
+            raise ValueError("invalid delta metadata")
         width = meta[0]
-        fmt = meta[1:].split(b"\x00", 1)[0].decode("ascii")
-        count, _ = _read_varint(meta, 1 + len(fmt))
+        fmt_len = meta[1]
+        fmt_start = 2
+        fmt_end = fmt_start + fmt_len
+        if fmt_end > len(meta):
+            raise ValueError("truncated delta format metadata")
+        fmt = meta[fmt_start:fmt_end].decode("ascii")
+        count, q = _read_varint(meta, fmt_end)
+        if q != len(meta):
+            raise ValueError("trailing delta metadata")
+        if width not in (1, 2, 4, 8):
+            raise ValueError("invalid delta width")
         vals = _undelta(_decode_svarints(payload, count))
         if width == 1:
+            if any(v < 0 or v > 255 for v in vals):
+                raise ValueError("delta byte out of range")
             return bytes(vals)
-        return b"".join(struct.pack(fmt, v) for v in vals)
+        try:
+            return b"".join(struct.pack(fmt, v) for v in vals)
+        except struct.error as exc:
+            raise ValueError("invalid delta value") from exc
+
     if kind == 2:
-        out = bytearray(); q = 0
+        out = bytearray()
+        q = 0
         while q < len(payload):
-            b = payload[q]; q += 1
+            b = payload[q]
+            q += 1
             n, q = _read_varint(payload, q)
             out.extend(bytes((b,)) * n)
         return bytes(out)
+
     if kind == 3:
         size, q = _read_varint(payload, 0)
         n, q = _read_varint(payload, q)
         dictionary = []
         for _ in range(n):
-            dictionary.append(payload[q:q + size]); q += size
-        return b"".join(dictionary[i] for i in payload[q:])
+            end = q + size
+            if end > len(payload):
+                raise ValueError("truncated dictionary")
+            dictionary.append(payload[q:end])
+            q = end
+        if n > 256:
+            raise ValueError("dictionary too large")
+        ids = payload[q:]
+        if any(i >= n for i in ids):
+            raise ValueError("invalid dictionary id")
+        return b"".join(dictionary[i] for i in ids)
+
     raise ValueError("unknown structural transform")
