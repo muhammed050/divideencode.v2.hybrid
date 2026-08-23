@@ -1,19 +1,4 @@
-"""DU1 — one universal reversible preconditioner for DE2.
-
-The project goal here is deliberately narrow: do not classify file types and
- do not choose between a family of codecs.  DU1 applies one fixed mathematical
- transformation to every byte stream, then gives that representation to DE2.
-
-For byte x_i, with x_-1 = 0:
-    r_i = (x_i - x_{i-1}) mod 256
-    s_i = r_i                 when r_i < 128
-          r_i - 256           otherwise
-    z_i = 2*s_i               when s_i >= 0
-          -2*s_i - 1          otherwise
-
-The signed residual is mapped by zigzag so nearby values occupy nearby small
-symbols.  The transform is exactly reversible and format-agnostic.
-"""
+"""DU1 — universal reversible preconditioner with payload integrity."""
 from __future__ import annotations
 
 import zlib
@@ -22,7 +7,9 @@ from .bitstream import decode_varint, encode_varint
 from .errors import CorruptedError, NotDivideEncodedError
 
 MAGIC = b"DU1"
-VERSION = 1
+# V2 adds a checksum of the exact DE2 payload.  The source checksum remains
+# as the end-to-end integrity check after the DU1 inverse transform.
+VERSION = 2
 FLAG_TRANSFORM = 1
 FLAG_IDENTITY = 0
 
@@ -68,13 +55,17 @@ def _wrap(flags: int, original_size: int, payload: bytes, checksum: int) -> byte
     out.append(flags)
     out += encode_varint(original_size)
     out += encode_varint(len(payload))
+    # The payload checksum is deliberately separate from the source checksum:
+    # DE2 may legally ignore a changed padding bit, so integrity must be
+    # checked before DE2 gets a chance to normalize/decode that payload.
+    out += (zlib.crc32(payload) & 0xFFFFFFFF).to_bytes(4, "little")
     out += checksum.to_bytes(4, "little")
     out += payload
     return bytes(out)
 
 
 def _unwrap(blob: bytes) -> tuple[int, int, int, bytes]:
-    if len(blob) < 9 or blob[:3] != MAGIC:
+    if len(blob) < 13 or blob[:3] != MAGIC:
         raise NotDivideEncodedError("not a DU1 universal container")
     if blob[3] != VERSION:
         raise NotDivideEncodedError("unsupported DU1 version %d" % blob[3])
@@ -83,33 +74,28 @@ def _unwrap(blob: bytes) -> tuple[int, int, int, bytes]:
         raise CorruptedError("unknown DU1 flags 0x%02x" % flags)
     original_size, pos = decode_varint(blob, 5, len(blob))
     payload_size, pos = decode_varint(blob, pos, len(blob))
-    if pos + 4 > len(blob):
-        raise CorruptedError("DU1 checksum truncated")
-    checksum = int.from_bytes(blob[pos:pos + 4], "little")
-    pos += 4
+    if pos + 8 > len(blob):
+        raise CorruptedError("DU1 checksums truncated")
+    payload_checksum = int.from_bytes(blob[pos:pos + 4], "little")
+    checksum = int.from_bytes(blob[pos + 4:pos + 8], "little")
+    pos += 8
     if payload_size != len(blob) - pos:
         raise CorruptedError("DU1 payload size mismatch")
-    return flags, original_size, checksum, bytes(blob[pos:])
+    payload = bytes(blob[pos:])
+    if (zlib.crc32(payload) & 0xFFFFFFFF) != payload_checksum:
+        raise CorruptedError("DU1 payload checksum mismatch")
+    return flags, original_size, checksum, payload
 
 
 def compress(data: bytes, *, block_size: int = 1 << 20,
              level: str = "BALANCED") -> bytes:
-    """DU1 -> DE2.
-
-    The transformed representation is always attempted first.  If DE2 makes
-    the untouched bytes smaller, DU1 records identity instead.  This is not a
-    second transform/codec; it is the lossless safety escape for data on which
-    a reversible preconditioner cannot improve DE2.
-    """
+    """DU1 -> DE2 with exact payload integrity protection."""
     from .de2 import compress as de2_compress
 
     src = bytes(data)
     transformed = encode(src)
     transformed_de2 = de2_compress(transformed, block_size=block_size,
                                    level=level)
-
-    # Compare only against direct DE2 to prevent the universal layer from
-    # ever becoming a size regression.  The actual transform remains unique.
     direct_de2 = de2_compress(src, block_size=block_size, level=level)
     if len(transformed_de2) < len(direct_de2):
         flags = FLAG_TRANSFORM
@@ -136,6 +122,5 @@ def decompress(blob: bytes, *, verify: bool = True) -> bytes:
 
 
 def transform_ratio(data: bytes) -> float:
-    """Return transformed-byte size / source-byte size (always 1.0 for non-empty input)."""
-    src = bytes(data)
-    return 1.0 if src else 1.0
+    """Return transformed-byte size / source-byte size."""
+    return 1.0
