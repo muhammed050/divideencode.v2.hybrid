@@ -1,15 +1,22 @@
 """Fast DE2-aware phrase6 preconditioner benchmark.
 
-Phrase6 is the strongest candidate found so far.  This version keeps the
+Phrase6 is the strongest candidate found so far. This version keeps the
 experiment focused on frequency-ranked 6-byte dictionaries, removes the
 expensive greedy/non-overlap search, uses O(1) phrase lookup during encoding,
 and uses a cheap proxy stage to avoid running DE2 for every dictionary size.
+
+DE2 trials are executed in parallel processes so wall-clock time is closer to
+the slowest trial instead of the sum of all trials. Use --workers to tune the
+CPU/memory trade-off (default: up to 3 workers).
 """
 from __future__ import annotations
 
+import argparse
+import os
 import struct
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +43,21 @@ def run_de2(data: bytes):
     if out != data:
         raise AssertionError("DE2 roundtrip mismatch")
     return blob, enc, dec
+
+
+def _trial_candidate(cand: Candidate, src: bytes):
+    """Run one candidate in a worker process."""
+    blob, enc, dec = run_de2(cand.packed)
+    ok = _decode(cand.packed) == src
+    if not ok:
+        raise AssertionError(f"preconditioner roundtrip mismatch: {cand.name}")
+    return cand.name, len(blob), enc, dec
+
+
+def _trial_direct(src: bytes):
+    """Run direct DE2 in a worker process."""
+    blob, enc, dec = run_de2(src)
+    return len(blob), enc, dec
 
 
 def _pack(dictionary: list[bytes], stream: bytes, original_size: int) -> bytes:
@@ -157,13 +179,7 @@ def _frequency6(pool: list[bytes], limit: int) -> list[bytes]:
 
 
 def candidates(src: bytes, max_de2_trials: int = 3):
-    """Build all cheap proxies, then send only the most promising to DE2.
-
-    The old benchmark spent one full DE2 pass on every limit.  The proxy
-    (dictionary header + encoded representation) is dramatically cheaper.
-    We rank all configured limits by proxy size and run DE2 only on the best
-    few, which keeps direct-DE2 as the mandatory fallback.
-    """
+    """Build cheap proxies, then send only the most promising to DE2."""
     pool = _discover6(src)
     if not pool:
         return
@@ -178,9 +194,6 @@ def candidates(src: bytes, max_de2_trials: int = 3):
         proxies.append((len(packed), limit, Candidate(
             f"phrase6_freq{limit}", packed, tuple(dictionary))))
 
-    # The proxy is not the final metric, so keep a small safety margin:
-    # always test the proxy winner plus two structurally different points.
-    # This is still only 3 DE2 runs instead of 8.
     proxies.sort(key=lambda x: (x[0], x[1]))
     chosen: list[tuple[int, int, Candidate]] = []
     seen: set[int] = set()
@@ -193,13 +206,10 @@ def candidates(src: bytes, max_de2_trials: int = 3):
                 seen.add(item[1])
 
     add_at(0)
-    # Also retain the largest dictionary when it is not the proxy winner;
-    # 255 was a real winner in the previous DE2 measurements.
     for idx, item in enumerate(proxies):
         if item[1] == 255:
             add_at(idx)
             break
-    # One middle candidate protects against proxy/DE2 disagreement.
     add_at(len(proxies) // 2)
 
     for _, _, cand in chosen:
@@ -207,39 +217,50 @@ def candidates(src: bytes, max_de2_trials: int = 3):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--workers", type=int,
+                    default=min(3, max(1, os.cpu_count() or 1)),
+                    help="parallel DE2 worker processes (default: up to 3)")
+    args = ap.parse_args()
+    workers = max(1, args.workers)
+
     files = sorted(p for p in CORPUS.iterdir() if p.is_file()) if CORPUS.exists() else []
     if not files:
         raise SystemExit(f"No corpus files found in {CORPUS}")
 
     print("DE2-AWARE PHRASE6 — SPEED-AWARE SEARCH")
-    print("cheap proxy ranking + max 3 DE2 trials + direct-DE2 fallback", flush=True)
+    print(f"cheap proxy ranking + parallel DE2 trials + direct-DE2 fallback (workers={workers})", flush=True)
 
     total_files = len(files)
-    for file_no, path in enumerate(files, 1):
-        src = path.read_bytes()
-        print(f"\n[{file_no}/{total_files}] {path.name}: direct DE2...", flush=True)
-        direct, de, dd = run_de2(src)
-        print("=" * 100)
-        print(f"{path.name} original={len(src):,} B")
-        print(f"  direct-DE2 final={len(direct):,} B ratio={len(direct)/len(src):.4f} enc={de:.3f}s dec={dd:.3f}s", flush=True)
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for file_no, path in enumerate(files, 1):
+            src = path.read_bytes()
+            print(f"\n[{file_no}/{total_files}] {path.name}: preparing candidates...", flush=True)
+            cands = list(candidates(src, max_de2_trials=3))
 
-        best_size = len(direct)
-        best_name = "direct-DE2"
-        cands = list(candidates(src, max_de2_trials=3))
-        total = len(cands)
-        for idx, cand in enumerate(cands, 1):
-            print(f"  [{idx}/{total}] {cand.name}: DE2...", end="", flush=True)
-            blob, enc, dec = run_de2(cand.packed)
-            ok = _decode(cand.packed) == src
-            if not ok:
-                raise AssertionError(f"preconditioner roundtrip mismatch: {cand.name}")
-            if len(blob) < best_size:
-                best_size = len(blob)
-                best_name = cand.name
-            print(f" {len(blob):,} B ({enc:.3f}s) ok", flush=True)
+            # Direct DE2 and all selected phrase trials start together.
+            futures = [
+                ("direct", pool.submit(_trial_direct, src)),
+                *[(cand.name, pool.submit(_trial_candidate, cand, src)) for cand in cands],
+            ]
 
-        print(f"  WINNER {best_name}; gain_vs_direct={len(direct)-best_size:+,} B", flush=True)
-        sys.stdout.flush()
+            print("=" * 100)
+            print(f"{path.name} original={len(src):,} B")
+            results = {}
+            for name, future in futures:
+                if name == "direct":
+                    size, enc, dec = future.result()
+                    results[name] = (size, enc, dec)
+                    print(f"  direct-DE2 final={size:,} B ratio={size/len(src):.4f} enc={enc:.3f}s dec={dec:.3f}s", flush=True)
+                else:
+                    cname, size, enc, dec = future.result()
+                    results[cname] = (size, enc, dec)
+                    print(f"  {cname:<25} DE2={size:,} B ({enc:.3f}s) ok", flush=True)
+
+            best_name, best = min(results.items(), key=lambda x: x[1][0])
+            direct_size = results["direct"][0]
+            print(f"  WINNER {best_name}; gain_vs_direct={direct_size-best[0]:+,} B", flush=True)
+            sys.stdout.flush()
 
 
 if __name__ == "__main__":
