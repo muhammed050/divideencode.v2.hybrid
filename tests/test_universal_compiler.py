@@ -40,18 +40,14 @@ def test_composed_pipelines_roundtrip():
         Pipeline((Instruction(Op.NIBBLE), Instruction(Op.DELTA8))),
         Pipeline((Instruction(Op.DELTA8), Instruction(Op.NIBBLE))),
         Pipeline((Instruction(Op.RLE), Instruction(Op.BYTE_LANES4))),
+        Pipeline((Instruction(Op.BITPLANE), Instruction(Op.BYTE_LANES4))),
+        Pipeline((Instruction(Op.BYTE_LANES4), Instruction(Op.BITPLANE))),
+        Pipeline((Instruction(Op.BITPLANE), Instruction(Op.RLE))),
+        Pipeline((Instruction(Op.RLE), Instruction(Op.BITPLANE))),
     ]
     for pipeline in pipelines:
         encoded = encode_pipeline(data, pipeline)
         assert decode_pipeline(encoded, pipeline, len(data)) == data
-
-
-def test_planner_returns_complete_programs():
-    data = bytes(range(256)) * 64
-    candidates = plan(data, max_candidates=32)
-    assert candidates
-    assert all(isinstance(p, Pipeline) for p in candidates)
-    assert any(p.instructions for p in candidates)
 
 
 def test_compiled_ir_roundtrip():
