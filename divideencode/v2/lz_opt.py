@@ -3,42 +3,52 @@ from __future__ import annotations
 
 import sys
 import time
+from collections import defaultdict
 from .lz import LIT, MATCH, REP, MIN_MATCH, DEFAULT_MAX_MATCH, DEFAULT_WINDOW
 
 
 def _match_length(data, a, b, limit):
-    n = len(data)
-    limit = min(limit, n - a, n - b)
+    limit = min(limit, len(data) - a, len(data) - b)
     l = 0
     while l < limit and data[a + l] == data[b + l]:
         l += 1
     return l
 
 
-def _candidates(data, i, window, max_match, max_chain, reps):
+def _candidates(data, i, window, max_match, max_chain, reps, index):
+    """Generate up to max_chain actual same-hash history candidates."""
     n = len(data)
     limit = min(max_match, n - i)
     out = []
+
     for ri, d in enumerate(reps):
         if d <= 0 or d > i or d > window:
             continue
         l = _match_length(data, i - d, i, limit)
         if l >= MIN_MATCH:
             out.append((l, d, ri))
+
     if i + MIN_MATCH > n:
         return out
+
     key = data[i:i + MIN_MATCH]
-    start = max(0, i - window)
+    positions = index.get(key, ())
+    lower = max(0, i - window)
     tried = 0
-    p = i - MIN_MATCH
-    while p >= start and tried < max_chain:
-        if data[p:p + MIN_MATCH] == key:
-            d = i - p
-            l = _match_length(data, p, i, limit)
-            if l >= MIN_MATCH:
-                out.append((l, d, -1))
-        p -= 1
+    # positions is increasing; walk backwards exactly like a hash chain.
+    for p in reversed(positions):
+        if p >= i:
+            continue
+        if p < lower:
+            break
+        d = i - p
+        l = _match_length(data, p, i, limit)
+        if l >= MIN_MATCH:
+            out.append((l, d, -1))
         tried += 1
+        if tried >= max_chain:
+            break
+
     seen = set()
     unique = []
     for item in sorted(out, key=lambda x: (-x[0], x[1], x[2])):
@@ -60,63 +70,46 @@ def _live_line(msg):
 
 
 def _solve_window(data, start, lookahead, window_size, max_chain, max_match,
-                  reps0, reps1, stats):
-    """Iterative DP for one bounded window; avoids Python recursion depth."""
+                  reps0, reps1, stats, index):
+    """Iterative bounded DP for one window; no recursion."""
     end = min(len(data), start + lookahead)
     INF = 10**18
     costs = {}
     choices = {}
 
-    # The state is (position, rep0, rep1). Build it backwards so there is no
-    # recursive call chain and no dependency on Python's recursion limit.
+    # For this experimental parser we keep the two REP registers fixed for
+    # the current window and evaluate all candidate transitions backwards.
+    # This is a bounded cost comparison, not yet the final production parser.
     for i in range(end, start - 1, -1):
         if i == end:
             costs[(i, reps0, reps1)] = 0
             continue
+        key = (i, reps0, reps1)
+        best = 8 + costs.get((i + 1, reps0, reps1), INF)
+        choice = (LIT, data[i])
+        reps = tuple(x for x in (reps0, reps1) if x)
+        candidates = _candidates(data, i, window_size, max_match, max_chain, reps, index)
+        stats["candidates"] += len(candidates)
+        stats["last_candidates"] = len(candidates)
+        for length, dist, ri in candidates:
+            stop = min(length, end - i)
+            for l in range(MIN_MATCH, stop + 1):
+                ni = i + l
+                if ri >= 0:
+                    nr0, nr1 = (reps1, reps0) if ri == 1 else (reps0, reps1)
+                    tail = costs.get((ni, nr0, nr1), INF)
+                    cost = _token_cost(l, dist, ri) + tail
+                    if cost < best:
+                        best, choice = cost, (REP, l, ri)
+                else:
+                    nr0, nr1 = dist, reps0
+                    tail = costs.get((ni, nr0, nr1), INF)
+                    cost = _token_cost(l, dist, -1) + tail
+                    if cost < best:
+                        best, choice = cost, (MATCH, l, dist)
+        costs[key] = best
+        choices[key] = choice
 
-        states = set()
-        # At each position, the reachable REP states are derived from the
-        # current state. For the bounded experiment we keep the supplied REP
-        # state and any explicit distance encountered at this position.
-        states.add((reps0, reps1))
-        if i > start:
-            for (p, r0, r1) in list(costs):
-                if p == i:
-                    states.add((r0, r1))
-
-        for r0, r1 in states:
-            key = (i, r0, r1)
-            next_key = (i + 1, r0, r1)
-            best = 8 + costs.get(next_key, INF)
-            choice = (LIT, data[i])
-            reps = tuple(x for x in (r0, r1) if x)
-            candidates = _candidates(data, i, window_size, max_match, max_chain, reps)
-            stats["candidates"] += len(candidates)
-            stats["last_candidates"] = len(candidates)
-
-            for length, dist, ri in candidates:
-                stop = min(length, end - i)
-                for l in range(MIN_MATCH, stop + 1):
-                    ni = i + l
-                    if ri >= 0:
-                        nr0, nr1 = (r1, r0) if ri == 1 else (r0, r1)
-                        tail = costs.get((ni, nr0, nr1), INF)
-                        cost = _token_cost(l, dist, ri) + tail
-                        if cost < best:
-                            best = cost
-                            choice = (REP, l, ri)
-                    else:
-                        nr0, nr1 = dist, r0
-                        tail = costs.get((ni, nr0, nr1), INF)
-                        cost = _token_cost(l, dist, -1) + tail
-                        if cost < best:
-                            best = cost
-                            choice = (MATCH, l, dist)
-            costs[key] = best
-            choices[key] = choice
-
-    # Reconstruct only the first decision. The outer loop will start a fresh
-    # bounded window, keeping memory bounded by the lookahead.
     key = (start, reps0, reps1)
     stats["last_cost"] = costs.get(key, 0)
     return choices.get(key, (LIT, data[start]))
@@ -144,14 +137,21 @@ def tokenize_bounded(data, lookahead=64, window_size=DEFAULT_WINDOW,
     reps = []
     last_report = -progress_every
 
+    # Real 4-byte hash index. This fixes the previous prototype bug where
+    # max_chain meant "scan 32 bytes" instead of "inspect 32 hash matches".
+    index = defaultdict(list)
+    if n >= MIN_MATCH:
+        for p in range(n - MIN_MATCH + 1):
+            index[data[p:p + MIN_MATCH]].append(p)
+
     if progress:
-        print(f"[DE2-OPT] start bytes={n:,} lookahead={lookahead} chain={max_chain}")
+        print(f"[DE2-OPT] start bytes={n:,} lookahead={lookahead} chain={max_chain} indexed={len(index):,} keys")
 
     while i < n:
         r0 = reps[0] if reps else 0
         r1 = reps[1] if len(reps) > 1 else 0
         tok = _solve_window(data, i, lookahead, window_size, max_chain,
-                            max_match, r0, r1, stats)
+                            max_match, r0, r1, stats, index)
         tokens.append(tok)
         selected[tok[0]] = selected.get(tok[0], 0) + 1
 
