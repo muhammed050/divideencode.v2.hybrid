@@ -19,6 +19,7 @@ from structural_benchmark import datasets
 
 def main() -> None:
     size = 128 * 1024
+    workloads = list(datasets(size))
     print("=" * 112)
     print("DIVIDE STRUCTURAL ENGINE — ADAPTIVE DECISION BENCHMARK")
     print(f"sample size : {size:,} bytes per workload")
@@ -28,15 +29,16 @@ def main() -> None:
 
     wins = 0
     regressions = 0
-    for name, data in datasets(size):
+    for name, data in workloads:
         raw_de2 = de2_compress(data)
 
         def score(blob: bytes) -> int:
             return len(de2_compress(blob))
 
         decision = adaptive_transform(data, scorer=score)
-        final = de2_compress(decision.blob)
-        assert de2_decompress(final) == decision.blob
+        downstream_input = data if decision.kind == "raw" else decision.blob
+        final = de2_compress(downstream_input)
+        assert de2_decompress(final) == downstream_input
         assert inverse(decision.blob) == data
 
         baseline = len(raw_de2)
@@ -53,7 +55,7 @@ def main() -> None:
               f"delta={selected - baseline:+,} B")
 
     print("-" * 112)
-    print(f"wins over raw DE2 : {wins}/{len(list(datasets(size)))}")
+    print(f"wins over raw DE2 : {wins}/{len(workloads)}")
     print(f"regressions       : {regressions}")
     assert regressions == 0, "adaptive decision layer regressed against raw DE2"
     print("PASS: adaptive layer never forces a worse representation on this suite.")
