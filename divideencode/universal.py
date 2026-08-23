@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from .de2 import compress as de2_compress, decompress as de2_decompress
 
 MAGIC = b"DU1"
-VERSION = 1
+VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -61,76 +61,62 @@ def _unxor(data: bytes) -> bytes:
     return bytes(out)
 
 
-def _bitplane(data: bytes) -> bytes:
-    """Serialize the 8 bit-planes as one byte per bit.
+def _bittranspose8(data: bytes) -> bytes:
+    """Transpose bits inside every 8-byte block without changing size.
 
-    This representation intentionally has 8 * N bytes: each original bit is
-    stored as a byte containing 0 or 1.  The previous implementation allocated
-    only N bytes and therefore overflowed as soon as p reached N.
+    Each 8-byte block is treated as an 8x8 bit matrix. Rows are the original
+    bytes and columns become output bytes. This preserves the exact byte count
+    unlike the old one-byte-per-bit representation.
     """
-    n = len(data)
-    if n == 0:
-        return b""
-    out = bytearray(n * 8)
-    p = 0
-    for bit in range(8):
-        for x in data:
-            out[p] = (x >> bit) & 1
-            p += 1
+    full = len(data) // 8 * 8
+    out = bytearray(len(data))
+    for off in range(0, full, 8):
+        block = data[off:off + 8]
+        for bit in range(8):
+            value = 0
+            for row in range(8):
+                value |= ((block[row] >> bit) & 1) << row
+            out[off + bit] = value
+    if full != len(data):
+        out[full:] = data[full:]
     return bytes(out)
 
 
-def _unbitplane(data: bytes) -> bytes:
-    n = len(data)
-    if n == 0:
-        return b""
-    if n % 8:
-        raise ValueError("invalid bitplane payload")
-    width = n // 8
-    out = bytearray(width)
-    p = 0
-    for bit in range(8):
-        for i in range(width):
-            out[i] |= (data[p] & 1) << bit
-            p += 1
-    return bytes(out)
+def _unbittranspose8(data: bytes) -> bytes:
+    # A transposed 8x8 bit matrix is inverted by the same operation.
+    return _bittranspose8(data)
 
 
 def _transpose16(data: bytes) -> bytes:
-    # Byte-matrix transpose for 16-byte rows. Tail is copied unchanged.
-    full = len(data) // 16 * 16
-    out = bytearray(full)
-    p = 0
-    for off in range(0, full, 16):
-        row = data[off:off + 16]
-        for col in range(16):
-            out[p] = row[col]
-            p += 1
-    return bytes(out) + data[full:]
+    """Transpose each 16x16 byte matrix (256-byte block), preserving size."""
+    full = len(data) // 256 * 256
+    out = bytearray(len(data))
+    for off in range(0, full, 256):
+        block = data[off:off + 256]
+        for row in range(16):
+            base = row * 16
+            for col in range(16):
+                out[off + col * 16 + row] = block[base + col]
+    if full != len(data):
+        out[full:] = data[full:]
+    return bytes(out)
 
 
 def _untranspose16(data: bytes) -> bytes:
-    full = len(data) // 16 * 16
-    out = bytearray(full)
-    p = 0
-    for off in range(0, full, 16):
-        for col in range(16):
-            out[off + col] = data[p]
-            p += 1
-    return bytes(out) + data[full:]
+    # Matrix transpose is an involution.
+    return _transpose16(data)
 
 
 def candidates(data: bytes) -> list[Candidate]:
     """Return generic candidates; no filename/extension classification."""
     data = bytes(data)
-    raw = [
+    return [
         Candidate("identity", 0, data, len(data)),
         Candidate("delta8", 1, _delta(data), len(data)),
         Candidate("xor8", 2, _xor(data), len(data)),
-        Candidate("bitplane8", 3, _bitplane(data), len(data) * 8),
+        Candidate("bittranspose8", 3, _bittranspose8(data), len(data)),
         Candidate("transpose16", 4, _transpose16(data), len(data)),
     ]
-    return raw
 
 
 def _inverse(ident: int, data: bytes) -> bytes:
@@ -141,7 +127,7 @@ def _inverse(ident: int, data: bytes) -> bytes:
     if ident == 2:
         return _unxor(data)
     if ident == 3:
-        return _unbitplane(data)
+        return _unbittranspose8(data)
     if ident == 4:
         return _untranspose16(data)
     raise ValueError(f"unknown universal transform {ident}")
@@ -165,7 +151,6 @@ def compress(data: bytes, *, max_candidates: int = 5) -> tuple[bytes, dict]:
     for cand in candidates(data)[:max_candidates]:
         packed = _pack(cand.ident, len(data), cand.data)
         blob = de2_compress(packed)
-        # Verify every candidate before it can win.
         decoded = de2_decompress(blob)
         ident, original_size, transformed = _unpack(decoded)
         if original_size != len(data) or _inverse(ident, transformed) != data:
