@@ -2,24 +2,23 @@
 
 Run from the repository root:
     python benchmarks/structural_benchmark.py
-
-The benchmark measures the actual end-to-end pipeline:
-    raw -> structural transform -> DE2
-and compares it with:
-    raw -> DE2
-    raw -> zlib/deflate
-    raw -> gzip
-    raw -> ZIP/deflate
-
-It also verifies both structural and final roundtrips for every case.
 """
 from __future__ import annotations
+
+# Make direct execution from the repository root independent of the caller's
+# PYTHONPATH. pytest already does this implicitly, but `python benchmarks/...`
+# does not because Python starts with the benchmarks directory on sys.path.
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import argparse
 import gzip
 import io
 import json
-import statistics
 import struct
 import time
 import zipfile
@@ -53,7 +52,6 @@ def _repeat_to_size(block: bytes, size: int) -> bytes:
 
 
 def make_numeric(size: int) -> bytes:
-    # Monotonic fixed-width integers: an ideal structural/delta workload.
     n = max(4, size // 4)
     return b"".join(struct.pack("<I", 1000 + i * 7) for i in range(n))[:size]
 
@@ -79,7 +77,6 @@ def make_json(size: int) -> bytes:
             "category": "standard",
             "tags": ["user", "record", "2026"],
         })
-    # Repeated compact JSON gives a realistic structured-text workload.
     data = json.dumps(rows, separators=(",", ":")).encode()
     return _repeat_to_size(data, size)
 
@@ -89,21 +86,23 @@ def make_logs(size: int) -> bytes:
     services = ("api", "worker", "auth", "billing")
     rows = []
     i = 0
-    while sum(len(x) for x in rows) < size:
+    total = 0
+    while total < size:
         level = levels[i % len(levels)]
         service = services[i % len(services)]
-        rows.append(
+        row = (
             f"2026-08-23T11:{i % 60:02d}:{i % 60:02d}Z {level} "
             f"service={service} request_id={i % 4096:04d} "
             f"user_id={1000 + i % 5000} status={200 if level != 'ERROR' else 500} "
             f"message=request_completed latency_ms={3 + i % 97}\n"
         )
+        rows.append(row)
+        total += len(row)
         i += 1
     return "".join(rows).encode()[:size]
 
 
 def make_binary(size: int) -> bytes:
-    # Fixed-size records with repeated categorical fields and slowly changing numbers.
     out = bytearray()
     i = 0
     while len(out) + 24 <= size:
