@@ -44,6 +44,18 @@ def _trial(kind_value: int, payload: bytes, source: bytes):
     return kind.name, size, enc, dec, len(payload)
 
 
+def _normalize_de2_result(result):
+    """Accept the normal 3-tuple and tolerate legacy 4/5-value workers.
+
+    The benchmark previously crashed when a worker returned metadata in
+    addition to size/encode/decode timing.  Keeping this normalization here
+    makes the parent process resilient while preserving the displayed metrics.
+    """
+    if not isinstance(result, tuple) or len(result) < 3:
+        raise ValueError(f"invalid DE2 result: {result!r}")
+    return result[0], result[1], result[2]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trials", type=int, default=3, help="top UBIR candidates sent to DE2")
@@ -77,7 +89,7 @@ def main():
             for label, future in futures:
                 result = future.result()
                 if label == "DIRECT":
-                    size, enc, dec = result
+                    size, enc, dec = _normalize_de2_result(result)
                     results[label] = (size, enc, dec)
                     print(f"  direct-DE2 {size:,} B ratio={size/len(src):.4f} enc={enc:.3f}s dec={dec:.3f}s", flush=True)
                 else:
