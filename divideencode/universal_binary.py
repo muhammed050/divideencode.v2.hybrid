@@ -13,6 +13,7 @@ MAGIC = b"UB2D"
 VERSION = 1
 _HEADER = struct.Struct("<4sBBHQQII")
 _DIRECT_SEARCH_CUTOFF = 0.10
+_SAMPLE_MIN_GAIN = 0.02
 
 
 class SearchMode(IntEnum):
@@ -108,7 +109,15 @@ def analyze(data: bytes, *, sample_size: int = 256 * 1024) -> Analysis:
     delta = _delta_sample(sample)
     xor = _xor_sample(sample)
     bitplane = _bitplane_sample(sample)
-    return Analysis(len(sample), _entropy(sample), _zero_ratio(sample), _ratio_equal(sample), _zero_ratio(delta), _zero_ratio(xor), _ratio_equal(bitplane))
+    return Analysis(
+        len(sample),
+        _entropy(sample),
+        _zero_ratio(sample),
+        _ratio_equal(sample),
+        _zero_ratio(delta),
+        _zero_ratio(xor),
+        _ratio_equal(bitplane),
+    )
 
 
 def _proxy(data: bytes) -> float:
@@ -124,15 +133,70 @@ def _proxy(data: bytes) -> float:
     return 1.0 / (1.0 + concentration * 0.015 + zeros * 2.5 + runs * 4.0)
 
 
+def _column_similarity(data: bytes, width: int) -> float:
+    """Estimate whether a fixed stride has correlated byte columns.
+
+    The metric is deliberately cheap and only used to decide which STRIDE
+    transforms deserve a real DE2 sample.  It compares adjacent modulo-width
+    columns by their byte-frequency distributions.  A high value means the
+    columns are similar enough that grouping them may expose redundancy.
+    """
+    if width <= 1 or len(data) < width * 8:
+        return 0.0
+    columns: list[list[int]] = [[0] * 256 for _ in range(width)]
+    counts = [0] * width
+    for i, b in enumerate(data):
+        c = i % width
+        columns[c][b] += 1
+        counts[c] += 1
+    similarity = 0.0
+    pairs = 0
+    for a in range(width - 1):
+        ca = counts[a]
+        if not ca:
+            continue
+        for b in range(a + 1, width):
+            cb = counts[b]
+            if not cb:
+                continue
+            overlap = sum(min(columns[a][v] / ca, columns[b][v] / cb) for v in range(256))
+            similarity += overlap
+            pairs += 1
+    return similarity / pairs if pairs else 0.0
+
+
+def _textlike(data: bytes) -> float:
+    if not data:
+        return 0.0
+    printable = sum(1 for b in data if b in (9, 10, 13) or 32 <= b <= 126)
+    return printable / len(data)
+
+
 def _candidate_pool(data: bytes, mode: SearchMode) -> list[Kind]:
     sample = bytes(data[:256 * 1024])
     if not sample:
         return []
+
+    # Start with transforms that have historically been useful for generic
+    # byte streams.  STRIDE transforms are content-gated because they are only
+    # useful when a fixed-width layout is actually present.
     candidates = [Kind.DELTA8, Kind.XOR8, Kind.BITPLANE, Kind.TRANSPOSE4, Kind.TRANSPOSE8]
+
+    text_ratio = _textlike(sample)
+    for width, threshold, kind in (
+        (2, 0.58, Kind.STRIDE2),
+        (4, 0.62, Kind.STRIDE4),
+        (8, 0.66, Kind.STRIDE8),
+    ):
+        similarity = _column_similarity(sample, width)
+        if similarity >= threshold and (text_ratio >= 0.70 or _entropy(sample) >= 5.0):
+            candidates.append(kind)
+
     low_nibble = sum((b & 0x0F) == 0 for b in sample) / len(sample)
     high_nibble = sum((b >> 4) == 0 for b in sample) / len(sample)
     if max(low_nibble, high_nibble) >= 0.20:
         candidates.append(Kind.NIBBLE)
+
     base = _proxy(sample)
     scored: list[tuple[float, Kind]] = []
     for kind in candidates:
@@ -145,24 +209,36 @@ def _candidate_pool(data: bytes, mode: SearchMode) -> list[Kind]:
     return [kind for _score, kind in scored[:pool_limit]]
 
 
-def _guided_candidates(data: bytes, mode: SearchMode, *, direct_size: int | None = None, sample_size: int = 64 * 1024) -> list[Kind]:
+def _guided_candidates(
+    data: bytes,
+    mode: SearchMode,
+    *,
+    direct_size: int | None = None,
+    sample_size: int = 64 * 1024,
+) -> list[Kind]:
     from .de2 import compress as de2_compress
+
     src = bytes(data)
     if not src:
         return []
     if direct_size is not None and direct_size / len(src) <= _DIRECT_SEARCH_CUTOFF:
         return []
+
     pool = _candidate_pool(src, mode)
     if not pool:
         return []
+
     sample = src[:sample_size]
     direct_sample_size = len(de2_compress(sample, level="BALANCED"))
     scored: list[tuple[int, Kind]] = []
     for kind in pool:
         transformed = transform(sample, kind)
         size = len(de2_compress(transformed, level="BALANCED"))
-        if size < direct_sample_size:
+        # A tiny sample win is not enough to justify a full-file transform.
+        # Require a meaningful margin to protect throughput.
+        if size <= direct_sample_size * (1.0 - _SAMPLE_MIN_GAIN):
             scored.append((size, kind))
+
     scored.sort(key=lambda x: (x[0], int(x[1])))
     if not scored:
         return []
@@ -173,13 +249,27 @@ def _guided_candidates(data: bytes, mode: SearchMode, *, direct_size: int | None
     return close[:2 if mode == SearchMode.BALANCED else 3]
 
 
-def rank_candidates(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, direct_size: int | None = None) -> list[Kind]:
+def rank_candidates(
+    data: bytes,
+    *,
+    mode: SearchMode | str = SearchMode.BALANCED,
+    direct_size: int | None = None,
+) -> list[Kind]:
     mode = _normalize_mode(mode)
     return [Kind.DIRECT] + _guided_candidates(bytes(data), mode, direct_size=direct_size)
 
 
 def _pack(kind: Kind, original_size: int, crc: int, payload: bytes) -> bytes:
-    header = _HEADER.pack(MAGIC, VERSION, int(kind), 0, original_size, len(payload), crc, zlib.crc32(payload) & 0xFFFFFFFF)
+    header = _HEADER.pack(
+        MAGIC,
+        VERSION,
+        int(kind),
+        0,
+        original_size,
+        len(payload),
+        crc,
+        zlib.crc32(payload) & 0xFFFFFFFF,
+    )
     return header + payload
 
 
@@ -200,8 +290,15 @@ def _unpack(blob: bytes) -> tuple[Kind, int, int, bytes]:
     return Kind(kind), original_size, crc, payload
 
 
-def compress(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, level: str = "BALANCED", block_size: int = 1 << 20) -> bytes:
+def compress(
+    data: bytes,
+    *,
+    mode: SearchMode | str = SearchMode.BALANCED,
+    level: str = "BALANCED",
+    block_size: int = 1 << 20,
+) -> bytes:
     from .de2 import compress as de2_compress
+
     src = bytes(data)
     direct_blob = de2_compress(src, block_size=block_size, level=level)
     kinds = rank_candidates(src, mode=mode, direct_size=len(direct_blob))
@@ -216,8 +313,15 @@ def compress(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, level
     return _pack(best_kind, len(src), zlib.crc32(src) & 0xFFFFFFFF, best_blob)
 
 
-def compress_with_stats(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, level: str = "BALANCED", block_size: int = 1 << 20) -> Result:
+def compress_with_stats(
+    data: bytes,
+    *,
+    mode: SearchMode | str = SearchMode.BALANCED,
+    level: str = "BALANCED",
+    block_size: int = 1 << 20,
+) -> Result:
     from .de2 import compress as de2_compress
+
     src = bytes(data)
     direct_blob = de2_compress(src, block_size=block_size, level=level)
     kinds = rank_candidates(src, mode=mode, direct_size=len(direct_blob))
@@ -231,11 +335,18 @@ def compress_with_stats(data: bytes, *, mode: SearchMode | str = SearchMode.BALA
         tested += 1
         if len(candidate) < len(best_blob):
             best_blob, best_kind, best_ir_size = candidate, kind, len(ir)
-    return Result(_pack(best_kind, len(src), zlib.crc32(src) & 0xFFFFFFFF, best_blob), best_kind, len(best_blob), best_ir_size, tested)
+    return Result(
+        _pack(best_kind, len(src), zlib.crc32(src) & 0xFFFFFFFF, best_blob),
+        best_kind,
+        len(best_blob),
+        best_ir_size,
+        tested,
+    )
 
 
 def decompress(blob: bytes, *, verify: bool = True) -> bytes:
     from .de2 import decompress as de2_decompress
+
     kind, original_size, crc, payload = _unpack(bytes(blob))
     ir = de2_decompress(payload, verify=verify)
     data = inverse(ir, kind, original_size=original_size)
