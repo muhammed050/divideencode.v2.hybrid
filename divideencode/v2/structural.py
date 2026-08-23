@@ -28,7 +28,8 @@ class Decision:
 
 
 MAGIC = b"SD1"
-_KIND_TO_ID = {"delta": 1, "rle": 2, "dict": 3}
+_KIND_TO_ID = {"delta": 1, "rle": 2, "dict": 3, "plane": 4}
+_ID_TO_KIND = {v: k for k, v in _KIND_TO_ID.items()}
 
 
 def _varint(n: int) -> bytes:
@@ -173,10 +174,43 @@ def _dictionary_candidate(data: bytes):
     return best
 
 
+def _plane_candidate(data: bytes):
+    """Transpose fixed-width records into byte planes.
+
+    For records like ``[a0 a1 a2 a3][b0 b1 b2 b3]...`` this emits
+    ``[a0 b0 ...][a1 b1 ...][a2 b2 ...][a3 b3 ...]``.  It is lossless and
+    deliberately limited to common fixed widths so arbitrary byte streams are
+    never expanded unless the downstream scorer actually wants the result.
+    """
+    best = None
+    for width in (2, 4, 8, 16):
+        if len(data) < width * 16 or len(data) % width:
+            continue
+        count = len(data) // width
+        planes = bytearray(len(data))
+        out = 0
+        for byte_index in range(width):
+            for record in range(count):
+                planes[out] = data[record * width + byte_index]
+                out += 1
+        meta = bytes((width,)) + _varint(count)
+        payload = bytes(planes)
+        total = len(MAGIC) + 1 + len(_varint(len(meta))) + len(meta) + len(payload)
+        if total < len(data):
+            # The transpose itself has the same byte count, so this branch is
+            # normally rejected here. Keep it available only when a future
+            # envelope/version makes the overhead negative; adaptive scoring
+            # is responsible for deciding real usefulness.
+            c = Candidate("plane", payload, meta, total)
+            if best is None or c.score < best.score:
+                best = c
+    return best
+
+
 def analyze(data: bytes):
     """Return conservative structural candidates ordered by own size."""
     candidates = []
-    for fn in (_delta_candidate, _rle_candidate, _dictionary_candidate):
+    for fn in (_delta_candidate, _rle_candidate, _dictionary_candidate, _plane_candidate):
         c = fn(data)
         if c is not None:
             candidates.append(c)
@@ -203,19 +237,17 @@ def adaptive_transform(data: bytes, scorer=None) -> Decision:
     """Choose the representation that is actually best downstream.
 
     ``scorer`` receives the exact structural representation that would be
-    passed to the downstream compressor. This deliberately keeps the RAW
-    representation in the same SD1 envelope as the transformed candidates,
-    so the scorer compares like-for-like representations and the returned
-    ``downstream_size`` is the scorer's exact result for the selected blob.
+    passed to the downstream compressor. RAW stays in the same SD1 envelope,
+    so the decision is made on complete representations rather than a proxy.
     """
     candidates = analyze(data)
     raw_blob = _raw_blob(data)
 
     if scorer is None:
         blob = transform(data)
-        kind = "raw" if blob[3] == 0 else next(
-            k for k, v in _KIND_TO_ID.items() if v == blob[3]
-        )
+        kind = "raw" if blob[3] == 0 else _ID_TO_KIND.get(blob[3])
+        if kind is None:
+            raise ValueError("unknown structural kind")
         return Decision(kind, blob, len(blob), None)
 
     options = [("raw", raw_blob)]
@@ -295,5 +327,24 @@ def inverse(blob: bytes) -> bytes:
         if any(i >= n for i in ids):
             raise ValueError("invalid dictionary id")
         return b"".join(dictionary[i] for i in ids)
+
+    if kind == 4:
+        if len(meta) < 1:
+            raise ValueError("invalid plane metadata")
+        width = meta[0]
+        if width not in (2, 4, 8, 16):
+            raise ValueError("invalid plane width")
+        count, q = _read_varint(meta, 1)
+        if q != len(meta):
+            raise ValueError("trailing plane metadata")
+        if count * width != len(payload):
+            raise ValueError("invalid plane payload size")
+        out = bytearray(len(payload))
+        p = 0
+        for byte_index in range(width):
+            for record in range(count):
+                out[record * width + byte_index] = payload[p]
+                p += 1
+        return bytes(out)
 
     raise ValueError("unknown structural transform")
