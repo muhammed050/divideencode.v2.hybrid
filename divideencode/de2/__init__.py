@@ -17,7 +17,7 @@ V1 is untouched and remains fully functional.
 from ..errors import CorruptedError
 from ..patterns import rle_encode, rle_decode
 
-from . import container, entropy, lz, transforms
+from . import container, entropy, lz, transforms, phrase
 from .classifier import (MODE_RAW, MODE_RLE, MODE_LZ, MODE_DELTA_LZ,
                          MODE_STRUCT_LZ, classify)
 from .container import (MAGIC, VERSION, FLAG_LZ_V2, parse_header,
@@ -35,8 +35,30 @@ def _encode_block(data, max_chain=lz.MAX_CHAIN, lazy=lz.LAZY, level=None):
     payload = None
     tmeta = b""
 
+    # Structured text now has a real reversible IR.  We keep the candidate
+    # adaptive: the phrase representation is only accepted when the final
+    # DE2 block (metadata + LZ frame + container fields) beats direct LZ.
+    if mode == MODE_STRUCT_LZ or (
+            len(data) >= 4096 and
+            fs.printable_frac >= 0.82 and
+            fs.match_density >= 0.03):
+        transformed, pmeta = phrase.encode(data, phrase_len=6, max_dict=255)
+        if transformed is not None:
+            frame = lz.encode_v2(transformed, max_chain=max_chain,
+                                 lazy=lazy, level=level)
+            phrase_block = write_block(MODE_STRUCT_LZ, pmeta, data, frame)
+            direct_frame = lz.encode_v2(data, max_chain=max_chain,
+                                        lazy=lazy, level=level)
+            direct_block = write_block(MODE_LZ, b"", data, direct_frame)
+            if len(phrase_block) < len(direct_block):
+                return phrase_block
+
+        # If phrase IR loses, continue with the normal mode selected by the
+        # classifier.  STRUCT+LZ therefore degrades safely to plain LZ.
+        if mode == MODE_STRUCT_LZ:
+            mode = MODE_LZ
+
     if mode == MODE_STRUCT_LZ:
-        # structured transform lands in M3; plain LZ stays correct
         mode = MODE_LZ
 
     if mode == MODE_RLE:
@@ -122,6 +144,14 @@ def decompress(blob, verify=True):
             data = transforms.transform_decode(inner, header.tmeta, raw_len)
             if len(data) != raw_len:
                 raise CorruptedError("delta produced wrong block size")
+        elif mode == MODE_STRUCT_LZ:
+            # Phrase IR changes the post-transform length, so its exact size
+            # is stored in tmeta and supplied to the LZ decoder before the
+            # dictionary inverse restores raw_len bytes.
+            transformed_len = phrase.transformed_length(header.tmeta)
+            inner, _p = frame_decode(payload, 0, len(payload),
+                                     transformed_len, tables)
+            data = phrase.decode(inner, header.tmeta, raw_len)
         else:
             raise CorruptedError("unhandled block mode %d" % mode)
         if verify:
