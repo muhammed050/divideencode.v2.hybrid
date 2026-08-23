@@ -1,36 +1,57 @@
-"""DE2 LZ/TSE core (M1/M2): the heart of V2.
+"""DE2 LZ/TSE core (M1/M2): the heart of V2/V3.
 
-Design goals honored from dd.txt §5-§6, §11, §13:
-- hash-based match finding over a configurable window (default 256 KiB)
-- minimum match 4, lengths varint-coded (259+ supported naturally)
-- bounded probing (max_chain), fast insertion, trimmed chains
-- one-step lazy parsing with an explicit cost comparison
-- repeat offsets rep0..rep3 with MRU updates
-- SEPARATED token streams: literals / literal-lengths / match-lengths /
-  distances -- entropy coding touches only the literal section today,
-  and the framing leaves room to code every stream later without
-  rewriting the parser.
+v3 matcher (branch v3-strong-core), format-compatible with the V2 frame:
+- multiplicative integer hash over 4-byte windows; flat head table +
+  prev-chain arrays replace the V2 dict-of-lists (no per-position bytes
+  slicing, no list append/trim churn)
+- bounded chain walk: max_chain depth, nice_len early exit, good_len
+  chain acceleration
+- holdback lazy parsing: the pending match is re-evaluated against the
+  next position's candidate with an explicit cost rule, so each position
+  is searched exactly once (the V2 engine searched twice per match)
+- REP0..3 candidates checked before every chain walk and preferred on
+  length ties against explicit distances (a rep symbol codes cheaper)
+- explicit deterministic levels: FAST / BALANCED / MAX
 
-Distance stream entries are varints with reserved values:
-    0..3  -> rep0..rep3 (most-recently-used order maintained)
-    >= 4  -> explicit distance (value - 3)
+Frame layout (unchanged, see decode()):
+    varint num_matches, varint literal_count,
+    entropy stream(literals),
+    varint len + entropy stream(literal lengths),
+    varint len + entropy stream(match lengths, value = len - MIN_MATCH),
+    varint len + entropy stream(distances: 0..3 = rep index, >=4 -> d - 3)
 
 The decoder is a flat iterative state machine: strict bounds checks,
 overlap-safe copies, exact stream accounting, no recursion.
 """
+from array import array
+
 from ..bitstream import encode_varint as _wv, decode_varint as _rv
 from ..errors import CorruptedError
 from . import entropy
 
 MIN_MATCH = 4
 DEFAULT_WINDOW = 262144          # 256 KiB
-MAX_CHAIN = 32                   # bounded probing
-LAZY = True                      # one-step lazy parsing
-CHAIN_HARD_LIMIT = 256           # per-chain storage trim
+MAX_CHAIN = 32                   # BALANCED probing bound (legacy default)
+LAZY = True                      # legacy knob kept for API compatibility
+CHAIN_HARD_LIMIT = 256           # legacy constant, unused by the v3 encoder
+
+M32 = 0xFFFFFFFF
+_KNUTH = 0x9E3779B1              # multiplicative hash constant
+
+# level -> knobs; budget_floor bounds the adaptive probe budget
+# (floor == max_chain disables shrinking: BALANCED/MAX always search deep)
+_LEVEL_FAST = dict(max_chain=6, lazy=False, nice_len=24, good_len=8,
+                   insert_step=3, budget_floor=2)
+_LEVEL_BALANCED = dict(max_chain=32, lazy=True, nice_len=96, good_len=24,
+                       insert_step=0, budget_floor=32)
+_LEVEL_MAX = dict(max_chain=512, lazy=True, nice_len=4096, good_len=128,
+                  insert_step=0, budget_floor=512)
+LEVELS = {"FAST": _LEVEL_FAST, "BALANCED": _LEVEL_BALANCED,
+          "MAX": _LEVEL_MAX}
 
 
 def _match_length(data, a, b, limit):
-    """Length of common prefix of data[a:] and data[b:], capped."""
+    """Length of common prefix of data[a:] and data[b:], capped at limit."""
     l = 0
     while l + 8 <= limit and data[a + l:a + l + 8] == data[b + l:b + l + 8]:
         l += 8
@@ -39,140 +60,231 @@ def _match_length(data, a, b, limit):
     return l
 
 
-def _find(data, i, n, reps, table, window, max_chain):
-    """Best match starting at i. Returns (length, dist, rep_index|-1)."""
-    best_len = 0
-    best_dist = 0
-    best_rep = -1
-    limit = n - i
-    if limit < MIN_MATCH:
-        return 0, 0, -1
+def encode(data, window=DEFAULT_WINDOW, max_chain=MAX_CHAIN, lazy=LAZY,
+           level=None):
+    """bytes -> DE2 LZ frame (separated streams, see module docstring).
 
-    # ---- repeat-offset candidates (cheap, checked first) ----
-    di = data[i]
-    for k in range(4):
-        d = reps[k]
-        if d > i or data[i - d] != di:
-            continue
-        l = _match_length(data, i - d, i, limit)
-        if l > best_len:
-            best_len = l
-            best_dist = d
-            best_rep = k
-            if l >= limit:
-                return l, d, k
+    level: "FAST" | "BALANCED" | "MAX". Explicit max_chain/lazy kwargs
+    override the level table (legacy API preserved).
+    """
+    if level is not None:
+        try:
+            cfg = LEVELS[level]
+        except KeyError:
+            raise ValueError("unknown LZ level %r" % (level,))
+        max_chain = cfg["max_chain"]
+        lazy = cfg["lazy"]
+    else:
+        # legacy explicit knobs win over the table; defaults mean BALANCED
+        cfg = LEVELS["BALANCED"]
+    nice_len = cfg["nice_len"]
+    good_len = cfg["good_len"]
+    forced_step = cfg["insert_step"]
+    budget_floor = cfg["budget_floor"]
 
-    # ---- hash-chain candidate ----
-    key = data[i:i + MIN_MATCH]
-    chain = table.get(key)
-    if chain is None:
-        return best_len, best_dist, best_rep
-    low = i - window
-    tried = 0
-    bl = best_len
-    bd = 0
-    for pos in reversed(chain):
-        if pos < low or tried >= max_chain:
-            break
-        tried += 1
-        if bl < limit and data[pos + bl] != data[i + bl]:
-            continue
-        l = _match_length(data, pos, i, limit)
-        if l > bl:
-            bl = l
-            bd = i - pos
-            if l >= limit:
-                break
-    if bl > best_len:
-        return bl, bd, -1
-    return best_len, best_dist, best_rep
-
-
-def encode(data, window=DEFAULT_WINDOW, max_chain=MAX_CHAIN, lazy=LAZY):
-    """bytes -> DE2 LZ frame (separated streams, see module docstring)."""
     n = len(data)
     literals = bytearray()
     ll_out = bytearray()
     ml_out = bytearray()
     dist_out = bytearray()
     num_matches = 0
-    reps = [1, 2, 4, 8]
-    table = {}
-    tget = table.get
-    i = 0
-    lit_start = 0
+    r0, r1, r2, r3 = 1, 2, 4, 8     # rep0..rep3 distances (MRU)
     nm = MIN_MATCH
 
+    if n == 0:
+        return _frame(num_matches, literals, ll_out, ml_out, dist_out)
+
+    # ---- hash structures: flat head table + prev chain array ----
+    hb = n.bit_length()
+    if hb < 12:
+        hb = 12
+    elif hb > 20:
+        hb = 20
+    hshift = 32 - hb
+    head = [-1] * (1 << hb)
+    prev = array("i", b"\xff\xff\xff\xff") * n   # all -1
+    fb4 = int.from_bytes
+
+    i = 0
+    lit_start = 0
+    ins_upto = 0                 # first position not yet hash-inserted
+    pend_pos = -1                # held-back match awaiting comparison
+    pend_len = 0
+    pend_dist = 0
+    pend_rep = -1
+    budget = max_chain           # adaptive probe budget (local repetitiveness)
+    key = -1                     # rolling 4-byte key; -1 = needs resync
+    seq_adv = False              # previous advance was a sequential i += 1
+
     while i < n:
-        best_len, best_dist, best_rep = _find(
-            data, i, n, reps, table, window, max_chain)
+        best_len = 0
+        best_dist = 0
+        best_rep = -1
+        limit = n - i
 
-        # ---- lazy one-step: prefer literal now if a longer match follows
-        if lazy and best_len >= nm and i + 1 <= n - nm \
-                and best_len < n - i:
-            nl, nd, nr = _find(data, i + 1, n, reps, table,
-                               window, max_chain)
-            if nl > best_len:
-                if n - i >= nm:
-                    key = data[i:i + nm]
-                    chain = tget(key)
-                    if chain is None:
-                        table[key] = [i]
-                    else:
-                        chain.append(i)
-                i += 1
-                continue
+        # ---- repeat-offset candidates (cheap, checked first) ----
+        di = data[i]
+        d = r0
+        if d <= i and data[i - d] == di:
+            l = _match_length(data, i - d, i, limit)
+            best_len = l
+            best_dist = d
+            best_rep = 0
+        d = r1
+        if d <= i and data[i - d] == di:
+            l = _match_length(data, i - d, i, limit)
+            if l > best_len:
+                best_len = l
+                best_dist = d
+                best_rep = 1
+        d = r2
+        if d <= i and data[i - d] == di:
+            l = _match_length(data, i - d, i, limit)
+            if l > best_len:
+                best_len = l
+                best_dist = d
+                best_rep = 2
+        d = r3
+        if d <= i and data[i - d] == di:
+            l = _match_length(data, i - d, i, limit)
+            if l > best_len:
+                best_len = l
+                best_dist = d
+                best_rep = 3
 
-        if best_len >= nm:
-            # ---- emit token ----
-            literals += data[lit_start:i]
-            ll_out += _wv(i - lit_start)
-            ml_out += _wv(best_len - nm)
-            if best_rep >= 0:
-                dist_out.append(best_rep)
-                if best_rep:
-                    reps.pop(best_rep)
-                    reps.insert(0, best_dist)
+        # ---- hash-chain candidates ----
+        h = -1
+        keyable = i + nm <= n
+        if keyable:
+            if key < 0 or not seq_adv:
+                key = fb4(data[i:i + nm], "little")
             else:
-                dist_out += _wv(best_dist + 3)
-                reps.pop()
-                reps.insert(0, best_dist)
-            num_matches += 1
-            # ---- index covered interior positions ----
-            stop = i + best_len
-            ins_end = stop
-            max_ins = n - nm + 1
-            if ins_end > max_ins:
-                ins_end = max_ins
-            step = 1 if best_len <= 8 else (2 if best_len <= 32 else 4)
-            j = i + 1
-            while j < ins_end:
-                k2 = data[j:j + nm]
-                ch2 = tget(k2)
-                if ch2 is None:
-                    table[k2] = [j]
+                # keep little-endian layout: drop low byte, append high
+                key = ((key >> 8) | (data[i + nm - 1] << 24)) & M32
+            if best_len < nice_len:
+                h = (key * _KNUTH & M32) >> hshift
+                pos = head[h]
+                if best_len >= good_len:
+                    depth = max_chain >> 2
+                elif budget < max_chain:
+                    depth = budget
                 else:
-                    ch2.append(j)
-                    if len(ch2) > CHAIN_HARD_LIMIT:
-                        del ch2[:CHAIN_HARD_LIMIT // 2]
-                j += step
-            i = stop
-            lit_start = i
-        else:
-            # ---- literal ----
-            if n - i >= nm:
-                key = data[i:i + nm]
-                chain = tget(key)
-                if chain is None:
-                    table[key] = [i]
-                else:
-                    chain.append(i)
-                    if len(chain) > CHAIN_HARD_LIMIT:
-                        del chain[:CHAIN_HARD_LIMIT // 2]
+                    depth = max_chain
+                bl = best_len
+                bd = 0
+                low_i = i - window
+                while pos >= 0 and depth > 0:
+                    if pos < low_i:
+                        break
+                    depth -= 1
+                    if bl < limit and data[pos + bl] == data[i + bl]:
+                        l = _match_length(data, pos, i, limit)
+                        if l > bl:
+                            bl = l
+                            bd = i - pos
+                            if l >= nice_len or l >= limit:
+                                break
+                    pos = prev[pos]
+                if bl > best_len:
+                    best_len = bl
+                    best_dist = bd
+                    best_rep = -1
+
+        # ---- adaptive probe budget from observed match yield ----
+        if best_len >= 16:
+            budget >>= 1
+            if budget < budget_floor:
+                budget = budget_floor
+        elif best_len < nm:
+            budget += 2
+            if budget > max_chain:
+                budget = max_chain
+
+        # ---- hash insertion of the current position ----
+        if keyable:
+            if h < 0:      # search was skipped (rep already at nice_len)
+                h = (key * _KNUTH & M32) >> hshift
+            if i >= ins_upto:
+                prev[i] = head[h]
+                head[h] = i
+                ins_upto = i + 1
+
+        # ---- parse decision (holdback lazy) ----
+        if pend_pos < 0:
+            if best_len >= nm:
+                pend_pos = i
+                pend_len = best_len
+                pend_dist = best_dist
+                pend_rep = best_rep
             i += 1
+            seq_adv = True
+            continue
+
+        # candidate at i competes with held match at pend_pos
+        take_new = best_len > pend_len
+        if lazy and not take_new and best_rep >= 0 and \
+                best_len == pend_len and pend_rep < 0:
+            take_new = True   # equal length, rep-coded: cheaper symbol
+        if take_new:
+            # held position falls into the literal run; hold new candidate
+            pend_pos = i
+            pend_len = best_len
+            pend_dist = best_dist
+            pend_rep = best_rep
+            i += 1
+            seq_adv = True
+            continue
+
+        # ---- emit the held match ----
+        p = pend_pos
+        L = pend_len
+        literals += data[lit_start:p]
+        ll_out += _wv(p - lit_start)
+        ml_out += _wv(L - nm)
+        if pend_rep == 0:
+            dist_out.append(0)
+        elif pend_rep == 1:
+            dist_out.append(1)
+            r1, r0 = r0, r1
+        elif pend_rep == 2:
+            dist_out.append(2)
+            r2, r1, r0 = r1, r0, r2
+        elif pend_rep == 3:
+            dist_out.append(3)
+            r3, r2, r1, r0 = r2, r1, r0, r3
+        else:
+            dist_out += _wv(pend_dist + 3)
+            r3, r2, r1, r0 = r2, r1, r0, pend_dist
+        num_matches += 1
+        # index covered interior positions (sparse on long matches)
+        stop = p + L
+        end_ins = n - nm + 1
+        if stop < end_ins:
+            end_ins = stop
+        step = forced_step
+        if not step:
+            step = 1 if L <= 16 else (2 if L <= 64 else 4)
+        j = p + 1
+        if j < ins_upto:
+            j += ((ins_upto - j + step - 1) // step) * step
+        while j < end_ins:
+            hj = (fb4(data[j:j + nm], "little") * _KNUTH & M32) >> hshift
+            prev[j] = head[hj]
+            head[hj] = j
+            j += step
+        if ins_upto < stop:
+            ins_upto = stop
+        lit_start = stop
+        pend_pos = -1
+        i = stop
+        seq_adv = False
 
     literals += data[lit_start:]
 
+    return _frame(num_matches, literals, ll_out, ml_out, dist_out)
+
+
+def _frame(num_matches, literals, ll_out, ml_out, dist_out):
     frame = bytearray()
     frame += _wv(num_matches)
     frame += _wv(len(literals))
@@ -220,7 +332,7 @@ def decode(blob, pos, end, raw_len, tables):
         raise CorruptedError("lz frame has excess data")
 
     out = bytearray()
-    reps = [1, 2, 4, 8]
+    r0, r1, r2, r3 = 1, 2, 4, 8
     li = 0
     for t in range(num_matches):
         ll = lls[t]
@@ -233,18 +345,24 @@ def decode(blob, pos, end, raw_len, tables):
         e = ds[t]
         olen = len(out)
         if e <= 3:
-            d = reps[e]
+            if e == 0:
+                d = r0
+            elif e == 1:
+                d = r1
+                r1, r0 = r0, r1
+            elif e == 2:
+                d = r2
+                r2, r1, r0 = r1, r0, r2
+            else:
+                d = r3
+                r3, r2, r1, r0 = r2, r1, r0, r3
             if d < 1 or d > olen:
                 raise CorruptedError("lz invalid repeat distance")
-            if e:
-                reps.pop(e)
-                reps.insert(0, d)
         else:
             d = e - 3
             if d < 1 or d > olen:
                 raise CorruptedError("lz invalid distance")
-            reps.pop()
-            reps.insert(0, d)
+            r3, r2, r1, r0 = r2, r1, r0, d
         if olen + ml > raw_len:
             raise CorruptedError("lz overrun of block size")
         src = olen - d

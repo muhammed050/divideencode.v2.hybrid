@@ -64,16 +64,14 @@ def make_codec_registry(levels=False):
 
     if levels:
         # DE2 matcher levels for the tuning matrix
-        def mk(chain, lazy):
+        def mk(level):
             def c(data):
                 from divideencode.de2 import lz
-                return lz.encode(data, max_chain=chain, lazy=lazy)
+                return lz.encode(data, level=level)
             return c
 
-        for name, chain, lazy in (("de2_fast", 4, False),
-                                  ("de2_balanced", 16, True),
-                                  ("de2_max", 128, True)):
-            add(name, mk(chain, lazy), None)   # size probe only
+        for name in ("FAST", "BALANCED", "MAX"):
+            add("lz_" + name.lower(), mk(name), None)   # size probe only
 
     add("zlib_9",
         lambda d: zlib.compress(d, 9),

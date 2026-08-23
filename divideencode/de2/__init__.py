@@ -23,7 +23,7 @@ from .features import scan_features
 DEFAULT_BLOCK_SIZE = 262144   # 256 KiB
 
 
-def _encode_block(data, max_chain=lz.MAX_CHAIN, lazy=lz.LAZY):
+def _encode_block(data, max_chain=lz.MAX_CHAIN, lazy=lz.LAZY, level=None):
     fs = scan_features(data)
     mode, hint = classify(fs)
 
@@ -48,7 +48,8 @@ def _encode_block(data, max_chain=lz.MAX_CHAIN, lazy=lz.LAZY):
         # fall through to size check with the ORIGINAL data length
 
     if mode == MODE_LZ and payload is None:
-        payload = lz.encode(data, max_chain=max_chain, lazy=lazy)
+        payload = lz.encode(data, max_chain=max_chain, lazy=lazy,
+                            level=level)
 
     # RAW fallback rule: never expand a block
     if payload is None or len(payload) >= len(data):
@@ -58,14 +59,13 @@ def _encode_block(data, max_chain=lz.MAX_CHAIN, lazy=lz.LAZY):
 
 
 def compress(data, block_size=DEFAULT_BLOCK_SIZE, max_chain=lz.MAX_CHAIN,
-             lazy=lz.LAZY):
+             lazy=lz.LAZY, level="BALANCED"):
     """Compress bytes into a DE2 container.
 
     block_size: independent block granularity (64 KiB..1 MiB sensible;
         larger blocks trade ~1-2% better ratio for decode locality).
-    max_chain/lazy: matcher knobs; the defaults are the benchmark-tuned
-        DE2-balanced profile (chain 64 measured -1.4% size for +21% time;
-        disabling lazy cost +12.7% size).
+    level: "FAST" | "BALANCED" | "MAX" matcher preset (v3). Explicit
+        max_chain/lazy kwargs override the preset for legacy callers.
     """
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise TypeError("compress expects bytes-like data")
@@ -74,7 +74,8 @@ def compress(data, block_size=DEFAULT_BLOCK_SIZE, max_chain=lz.MAX_CHAIN,
     blocks = []
     for off in range(0, n, block_size):
         chunk = data[off:off + block_size]
-        blob = _encode_block(chunk, max_chain=max_chain, lazy=lazy)
+        blob = _encode_block(chunk, max_chain=max_chain, lazy=lazy,
+                             level=level)
         blocks.append(blob)
     out = bytearray()
     out += write_header(n, len(blocks))
