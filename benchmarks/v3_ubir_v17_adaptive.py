@@ -1,28 +1,24 @@
 """V1.7 DE2-oriented adaptive routing experiment.
 
 Research only: compare direct DE2 with UBIR V1.6 -> DE2 and record the
-candidate that produces the smallest DE2 output. The experiment deliberately
-treats IR size as diagnostic rather than an optimization target.
+candidate that produces the smallest DE2 output. IR size is diagnostic only.
 
-V1.6 is JSON-only. Direct DE2, however, requires an explicit kind, so this
-benchmark dispatches JSON/CSV by suffix and keeps unsupported formats as a
-clear direct-DE2-only baseline.
+A suffix is only a routing hint: the universal codec may still reject the
+actual bytes (for example, a non-canonical CSV). Such a candidate is marked
+unsupported instead of aborting the complete corpus benchmark.
 """
 from __future__ import annotations
 import time
 from pathlib import Path
 from divideencode.v3 import ubir_v16 as v16
+from divideencode.v3 import universal_binary_ir as de
 
 ROOT = Path(__file__).resolve().parents[1]
 CORPUS = ROOT / "benchmarks" / "corpus"
-
-from divideencode.v3 import universal_binary_ir as de
-
 FILES = sorted(p for p in CORPUS.iterdir() if p.is_file())
 
 
 def kind_for(path: Path) -> str | None:
-    """Return the DE2/UBIR kind supported by the public universal codec."""
     s = path.suffix.lower()
     if s in {".json", ".jsonl"}:
         return "json"
@@ -32,7 +28,6 @@ def kind_for(path: Path) -> str | None:
 
 
 def de2(blob: bytes, kind: str):
-    """Run DE2 with its required explicit input kind and verify roundtrip."""
     t = time.perf_counter()
     packed = de.encode(blob, kind)
     et = time.perf_counter() - t
@@ -44,10 +39,19 @@ def de2(blob: bytes, kind: str):
     return len(packed), et, dt
 
 
+def try_de2(blob: bytes, kind: str):
+    """Return DE2 metrics, or None when the input is not accepted by the codec."""
+    try:
+        return de2(blob, kind)
+    except (ValueError, UnicodeError, UnicodeDecodeError) as exc:
+        print(f"  direct DE2 unsupported/incompatible: {exc}")
+        return None
+
+
 def main():
     print("V1.7 DE2-ORIENTED ADAPTIVE ROUTING")
     print("criterion=final_DE2_size; IR_size_is_diagnostic_only")
-    print("direct DE2 dispatch: .json/.jsonl -> json, .csv -> csv")
+    print("dispatch: .json/.jsonl -> json, .csv -> csv; unsupported candidates are skipped")
 
     for path in FILES:
         data = path.read_bytes()
@@ -59,7 +63,12 @@ def main():
             print("  adaptive winner=unsupported")
             continue
 
-        direct, det, ddt = de2(data, kind)
+        direct_result = try_de2(data, kind)
+        if direct_result is None:
+            print("  adaptive winner=unsupported")
+            continue
+
+        direct, det, ddt = direct_result
         print(f"  direct DE2={direct:7d} B encode={det:.2f}s de2={ddt:.2f}s kind={kind}")
 
         # V1.6 is currently JSON-only. Never force other formats through it.
@@ -67,7 +76,13 @@ def main():
             t = time.perf_counter()
             ir = v16.encode(data, "json")
             iet = time.perf_counter() - t
-            packed, pet, pdt = de2(ir, "json")
+            packed_result = try_de2(ir, "json")
+            if packed_result is None:
+                print("  V1.6 -> DE2 unsupported/incompatible")
+                print("  adaptive winner=direct")
+                continue
+
+            packed, pet, pdt = packed_result
             recovered = v16.decode(ir)
             if recovered != data:
                 raise AssertionError("V1.6 roundtrip mismatch")
