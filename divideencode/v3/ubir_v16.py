@@ -23,11 +23,13 @@ def _pack3(values: list[int]) -> bytes:
     out = bytearray((len(values) * 3 + 7) // 8)
     bit = 0
     for x in values:
+        x &= 7
         byte = bit >> 3
         shift = bit & 7
-        out[byte] |= (x & 7) << shift
+        value = x << shift
+        out[byte] |= value & 0xFF
         if shift > 5:
-            out[byte + 1] |= (x & 7) >> (8 - shift)
+            out[byte + 1] |= (value >> 8) & 0xFF
         bit += 3
     return bytes(out)
 
@@ -61,33 +63,24 @@ def encode_json(data: bytes) -> bytes:
     tokens = v1._json_tokens(data)
     from collections import Counter
     strings = Counter(t for t in tokens if t[:1] == b'"')
-    dictionary = sorted(
-        (x for x, n in strings.items() if n >= 2),
-        key=lambda x: (-strings[x] * len(x), x),
-    )
+    dictionary = sorted((x for x, n in strings.items() if n >= 2), key=lambda x: (-strings[x] * len(x), x))
     ids = {x: i for i, x in enumerate(dictionary)}
-
-    classes: list[int] = []
-    punct = bytearray(); dict_lane = bytearray(); string_lane = bytearray()
-    int_lane = bytearray(); raw_lane = bytearray(); const_codes: list[int] = []
+    classes = []
+    punct = bytearray(); dict_lane = bytearray(); string_lane = bytearray(); int_lane = bytearray(); raw_lane = bytearray(); const_codes = []
     prev_int = 0
     for t in tokens:
         if t[:1] in b"{}[],:":
             classes.append(PUNCT); punct.append(PMAP[t[0]])
         elif t[:1] == b'"':
             i = ids.get(t)
-            if i is None:
-                classes.append(STRING); string_lane += v1._s(t)
-            else:
-                classes.append(DICT); dict_lane += v1._u(i)
+            if i is None: classes.append(STRING); string_lane += v1._s(t)
+            else: classes.append(DICT); dict_lane += v1._u(i)
         elif v1._JSON_INT.fullmatch(t.decode("ascii")):
-            classes.append(INT)
-            value = int(t); int_lane += v1._u(v1._zz(value - prev_int)); prev_int = value
+            classes.append(INT); value = int(t); int_lane += v1._u(v1._zz(value - prev_int)); prev_int = value
         elif t in CONST_MAP:
             classes.append(CONST); const_codes.append(CONST_MAP[t])
         else:
             classes.append(RAW); raw_lane += v1._s(t)
-
     class_bytes = _pack3(classes)
     lanes = (punct, dict_lane, string_lane, int_lane, raw_lane, bytearray(_pack2(const_codes)))
     out = bytearray(v1._u(len(dictionary)))
@@ -119,7 +112,6 @@ def decode_json(payload: bytes) -> bytes:
         if p + nbytes > len(payload): raise ValueError("truncated lane")
         lanes.append(payload[p:p + nbytes]); p += nbytes
     if p != len(payload): raise ValueError("trailing UBIR V1.6 bytes")
-
     pp = pd = ps = pi = pr = pc = 0
     if len(lanes[5]) != (const_count * 2 + 7) // 8: raise ValueError("bad constant lane")
     const_codes = _unpack2(lanes[5], const_count)
@@ -137,8 +129,7 @@ def decode_json(payload: bytes) -> bytes:
         elif tag == STRING:
             x, ps = v1._g(lanes[2], ps); out += x
         elif tag == INT:
-            z, pi = v1._r(lanes[3], pi); prev_int += v1._uzz(z)
-            out += str(prev_int).encode("ascii")
+            z, pi = v1._r(lanes[3], pi); prev_int += v1._uzz(z); out += str(prev_int).encode("ascii")
         elif tag == RAW:
             x, pr = v1._g(lanes[4], pr); out += x
         elif tag == CONST:
