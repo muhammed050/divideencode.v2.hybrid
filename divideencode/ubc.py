@@ -1,15 +1,4 @@
-"""Universal Binary Compiler (UBC).
-
-The UBC language is deliberately simple: every input byte is represented by a
-literal BYTE token.  The representation is therefore defined for *all* byte
-strings, including completely random data.  DE2 is the backend: it receives
-only the UBC bytecode and may compress its structure.
-
-This module does not classify files and does not choose transforms.  Its sole
-job is the universal, lossless translation requested by UBC:
-
-    bytes -> UBC binary language -> bytes
-"""
+"""Universal Binary Compiler (UBC): bytes -> UBC language -> DE2."""
 from __future__ import annotations
 
 import struct
@@ -17,10 +6,7 @@ import zlib
 
 MAGIC = b"UBC1"
 VERSION = 1
-# One instruction: opcode + literal byte.
 OP_BYTE = 0x01
-# Stream terminator. It is never ambiguous because every instruction has a
-# fixed two-byte representation.
 OP_END = 0x00
 _HEADER = struct.Struct("<4sBBQII")
 
@@ -30,7 +16,7 @@ class UBCError(ValueError):
 
 
 def encode(data: bytes | bytearray | memoryview) -> bytes:
-    """Translate arbitrary bytes into the UBC binary language."""
+    """Translate arbitrary bytes into the universal UBC binary language."""
     src = bytes(data)
     body = bytearray(2 * len(src) + 1)
     p = 0
@@ -79,10 +65,28 @@ def decode(program: bytes | bytearray | memoryview) -> bytes:
 
 
 def compile(data: bytes | bytearray | memoryview) -> bytes:
-    """Alias for the universal compiler entry point."""
     return encode(data)
 
 
 def decompile(program: bytes | bytearray | memoryview) -> bytes:
-    """Alias for the universal decoder entry point."""
     return decode(program)
+
+
+def compress(data: bytes | bytearray | memoryview, **kwargs) -> bytes:
+    """Direct UBC -> DE2 backend. No selector or extra transform is used."""
+    from .de2 import compress as de2_compress
+    return de2_compress(encode(data), **kwargs)
+
+
+def decompress(blob: bytes | bytearray | memoryview, *, verify: bool = True) -> bytes:
+    """Direct DE2 -> UBC -> original bytes backend."""
+    from .de2 import decompress as de2_decompress
+    return decode(de2_decompress(bytes(blob), verify=verify))
+
+
+def compile_to_de2(data: bytes | bytearray | memoryview, **kwargs) -> bytes:
+    return compress(data, **kwargs)
+
+
+def decompile_from_de2(blob: bytes | bytearray | memoryview, *, verify: bool = True) -> bytes:
+    return decompress(blob, verify=verify)
