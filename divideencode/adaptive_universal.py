@@ -238,17 +238,22 @@ def choose_path(m: Metrics) -> int:
     return FLAG_DIRECT
 
 
-def _wrap(flag: int, original_size: int, block_size: int, checksum: int, payload: bytes) -> bytes:
-    return bytes((flag,)) + MAGIC + bytes((VERSION,)) + struct.pack("<III", original_size, block_size, checksum) + payload
+def _wrap(flag: int, original_size: int, block_size: int, checksum: int, payload_checksum: int, payload: bytes) -> bytes:
+    # The payload checksum is intentionally separate from the source checksum:
+    # a bit flip in compressed bytes must be rejected even when the downstream
+    # codec happens to decode the corrupted bitstream to the same source bytes.
+    return bytes((flag,)) + MAGIC + bytes((VERSION,)) + struct.pack(
+        "<IIII", original_size, block_size, checksum, payload_checksum
+    ) + payload
 
 
 def _unwrap(blob: bytes):
-    if len(blob) < 18 or blob[0] not in (1, 2, 3) or blob[1:5] != MAGIC or blob[5] != VERSION:
+    if len(blob) < 22 or blob[0] not in (1, 2, 3) or blob[1:5] != MAGIC or blob[5] != VERSION:
         raise NotDivideEncodedError("not an Adaptive Universal BWT container")
-    original_size, block_size, checksum = struct.unpack_from("<III", blob, 6)
+    original_size, block_size, checksum, payload_checksum = struct.unpack_from("<IIII", blob, 6)
     if block_size == 0 or block_size > 1 << 20:
         raise CorruptedError("invalid adaptive BWT block size")
-    return blob[0], original_size, block_size, checksum, bytes(blob[18:])
+    return blob[0], original_size, block_size, checksum, payload_checksum, bytes(blob[22:])
 
 
 def compress(data: bytes, *, filename: str | None = None, block_size: int = DEFAULT_BWT_BLOCK, level: str = "BALANCED") -> bytes:
@@ -256,7 +261,7 @@ def compress(data: bytes, *, filename: str | None = None, block_size: int = DEFA
     src = bytes(data)
     direct = de2_compress(src, block_size=1 << 20, level=level)
     if not src:
-        return _wrap(FLAG_DIRECT, 0, block_size, zlib.crc32(src) & 0xFFFFFFFF, direct)
+        return _wrap(FLAG_DIRECT, 0, block_size, zlib.crc32(src) & 0xFFFFFFFF, zlib.crc32(direct) & 0xFFFFFFFF, direct)
     selected = choose_path(analyze(src, filename=filename))
     if selected != FLAG_DIRECT:
         transformed = _blocks_encode(src, block_size)
@@ -267,12 +272,14 @@ def compress(data: bytes, *, filename: str | None = None, block_size: int = DEFA
             direct = candidate
         else:
             selected = FLAG_DIRECT
-    return _wrap(selected, len(src), block_size, zlib.crc32(src) & 0xFFFFFFFF, direct)
+    return _wrap(selected, len(src), block_size, zlib.crc32(src) & 0xFFFFFFFF, zlib.crc32(direct) & 0xFFFFFFFF, direct)
 
 
 def decompress(blob: bytes, *, verify: bool = True) -> bytes:
     from .de2 import decompress as de2_decompress
-    flag, original_size, block_size, checksum, payload = _unwrap(bytes(blob))
+    flag, original_size, block_size, checksum, payload_checksum, payload = _unwrap(bytes(blob))
+    if verify and zlib.crc32(payload) & 0xFFFFFFFF != payload_checksum:
+        raise CorruptedError("adaptive payload checksum mismatch")
     transformed = de2_decompress(payload, verify=verify)
     if flag == FLAG_DIRECT:
         data = transformed
