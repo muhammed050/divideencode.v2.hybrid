@@ -1,21 +1,13 @@
-"""Adaptive Universal BWT front-end for DE2.
+"""Adaptive Universal BWT -> DE2 front-end.
 
-The selector is deliberately a single front-end: it does not expose a family
-of codecs to callers.  It measures the input, performs a bounded BWT+MTF trial,
-and selects either DE2-direct or BWT->MTF (optionally RLE) before handing the
-result to DE2.
+One selector, three wire paths:
+  0x01 = DE2 direct
+  0x02 = BWT -> MTF -> DE2
+  0x03 = BWT -> MTF -> RLE -> DE2
 
-Container format:
-    [1-byte path flag] [header/version/metadata] [DE2 payload]
-
-Flags:
-    0x01 direct DE2
-    0x02 BWT -> MTF -> DE2
-    0x03 BWT -> MTF -> RLE -> DE2
-
-BWT is applied independently to bounded blocks so the universal front-end
-remains practical on large files.  Each BWT block carries its primary index;
-the block size and original size are stored in the wrapper metadata.
+The first byte is always the path flag. Metrics use the first 64 KiB and a
+bounded 8-16 KiB BWT/MTF trial. BWT is block-local (64 KiB by default) so large
+files remain bounded in memory and decoding is independently reversible.
 """
 from __future__ import annotations
 
@@ -34,7 +26,6 @@ VERSION = 1
 DEFAULT_SAMPLE = 64 * 1024
 DEFAULT_TRIAL = 12 * 1024
 DEFAULT_BWT_BLOCK = 64 * 1024
-
 _COMPRESSED_SIGNATURES = (
     b"PK\x03\x04", b"\x1f\x8b", b"BZh", b"7z\xbc\xaf\x27\x1c",
     b"\xfd7zXZ\x00", b"Rar!\x1a\x07", b"\x89PNG\r\n\x1a\n",
@@ -66,63 +57,42 @@ def shannon_entropy(data: bytes) -> float:
 def consecutive_repetition_ratio(data: bytes) -> float:
     if len(data) < 3:
         return 0.0
-    hits = 0
     total = len(data) - 2
-    for i in range(total):
-        if data[i] == data[i + 1] or data[i] == data[i + 2]:
-            hits += 1
-    return hits / total
+    return sum(data[i] == data[i + 1] or data[i] == data[i + 2] for i in range(total)) / total
 
 
-def _bwt(block: bytes) -> tuple[bytes, int]:
-    """Cyclic BWT using prefix-doubling ranks; practical for 64 KiB blocks."""
-    n = len(block)
+def _bwt(data: bytes) -> tuple[bytes, int]:
+    """Cyclic BWT via prefix-doubling ranks; no sentinel is required."""
+    n = len(data)
     if n <= 1:
-        return block, 0
-    # Add a unique sentinel rank smaller than every byte.  Sorting cyclic
-    # rotations of block + sentinel gives a standard reversible BWT.
-    s = list(block) + [-1]
-    m = n + 1
-    order = list(range(m))
-    rank = [x + 1 for x in s]
+        return data, 0
+    order = list(range(n))
+    rank = list(data)
     k = 1
-    while k < m:
-        order.sort(key=lambda i: (rank[i], rank[(i + k) % m]))
-        new_rank = [0] * m
+    while k < n:
+        order.sort(key=lambda i: (rank[i], rank[(i + k) % n]))
+        new = [0] * n
         r = 0
         prev = order[0]
-        new_rank[prev] = 0
+        new[prev] = 0
         for idx in order[1:]:
-            a = (rank[prev], rank[(prev + k) % m])
-            b = (rank[idx], rank[(idx + k) % m])
-            if a != b:
+            if (rank[prev], rank[(prev + k) % n]) != (rank[idx], rank[(idx + k) % n]):
                 r += 1
-            new_rank[idx] = r
+            new[idx] = r
             prev = idx
-        rank = new_rank
-        if r == m - 1:
+        rank = new
+        if r == n - 1:
             break
         k <<= 1
-    last = bytearray()
-    primary = 0
-    for row, start in enumerate(order):
-        if start == 0:
-            primary = row
-        last.append(0 if start == n else block[start - 1])
-    # Remove the sentinel row: it is the row whose last byte was sentinel.
-    sentinel_row = order.index(n)
-    del last[sentinel_row]
-    if sentinel_row < primary:
-        primary -= 1
-    return bytes(last), primary
+    primary = order.index(0)
+    last = bytes(data[(i - 1) % n] for i in order)
+    return last, primary
 
 
 def _ibwt(last: bytes, primary: int) -> bytes:
     n = len(last)
     if n <= 1:
         return last
-    # Standard LF mapping with occurrence ranks. Python's lists keep this
-    # bounded to the configured BWT block size.
     counts = [0] * 256
     occ = [0] * n
     for i, b in enumerate(last):
@@ -144,10 +114,10 @@ def _ibwt(last: bytes, primary: int) -> bytes:
 
 def _mtf_encode(data: bytes) -> bytes:
     table = list(range(256))
-    out = bytearray(len(data))
-    for i, b in enumerate(data):
+    out = bytearray()
+    for b in data:
         p = table.index(b)
-        out[i] = p
+        out.append(p)
         if p:
             table.pop(p)
             table.insert(0, b)
@@ -156,12 +126,10 @@ def _mtf_encode(data: bytes) -> bytes:
 
 def _mtf_decode(data: bytes) -> bytes:
     table = list(range(256))
-    out = bytearray(len(data))
-    for i, p in enumerate(data):
-        if p > 255:
-            raise CorruptedError("invalid MTF symbol")
+    out = bytearray()
+    for p in data:
         b = table[p]
-        out[i] = b
+        out.append(b)
         if p:
             table.pop(p)
             table.insert(0, b)
@@ -177,15 +145,15 @@ def _rle_encode(data: bytes) -> bytes:
         while j < len(data) and data[j] == b and j - i < 255:
             j += 1
         run = j - i
-        if run >= 4 or b == 0:
-            out += b"\x00" + bytes((b, run))
+        if b == 0 or run >= 4:
+            out += bytes((0, b, run))
         else:
             out += bytes((b,)) * run
         i = j
     return bytes(out)
 
 
-def _rle_decode(data: bytes, expected: int) -> bytes:
+def _rle_decode(data: bytes) -> bytes:
     out = bytearray()
     i = 0
     while i < len(data):
@@ -201,25 +169,21 @@ def _rle_decode(data: bytes, expected: int) -> bytes:
         else:
             out.append(b)
             i += 1
-        if len(out) > expected:
-            raise CorruptedError("adaptive RLE expansion overflow")
-    if len(out) != expected:
-        raise CorruptedError("adaptive RLE size mismatch")
     return bytes(out)
 
 
-def _bwt_blocks_encode(data: bytes, block_size: int) -> bytes:
+def _blocks_encode(data: bytes, block_size: int) -> bytes:
     out = bytearray()
     for off in range(0, len(data), block_size):
         block = data[off:off + block_size]
         last, primary = _bwt(block)
-        transformed = _mtf_encode(last)
+        mtf = _mtf_encode(last)
         out += struct.pack("<II", len(block), primary)
-        out += transformed
+        out += mtf
     return bytes(out)
 
 
-def _bwt_blocks_decode(data: bytes, original_size: int, block_size: int) -> bytes:
+def _blocks_decode(data: bytes, original_size: int, block_size: int) -> bytes:
     out = bytearray()
     pos = 0
     while len(out) < original_size:
@@ -231,72 +195,56 @@ def _bwt_blocks_decode(data: bytes, original_size: int, block_size: int) -> byte
             raise CorruptedError("invalid adaptive BWT block length")
         if pos + raw_len > len(data):
             raise CorruptedError("truncated adaptive BWT block")
-        mtf = data[pos:pos + raw_len]
+        last = _mtf_decode(data[pos:pos + raw_len])
         pos += raw_len
-        last = _mtf_decode(mtf)
         if primary >= raw_len:
             raise CorruptedError("invalid adaptive BWT primary index")
         out += _ibwt(last, primary)
     if pos != len(data):
-        raise CorruptedError("adaptive BWT payload trailing bytes")
+        raise CorruptedError("adaptive BWT trailing bytes")
     return bytes(out)
+
+
+def _extension(filename: str | None) -> str | None:
+    return filename.rsplit(".", 1)[1].lower() if filename and "." in filename else None
 
 
 def _signature(data: bytes) -> bool:
     return any(data.startswith(sig) for sig in _COMPRESSED_SIGNATURES)
 
 
-def _extension_hint(filename: str | None) -> str | None:
-    if not filename or "." not in filename:
-        return None
-    return filename.rsplit(".", 1)[1].lower()
-
-
 def analyze(data: bytes, *, filename: str | None = None, trial_size: int = DEFAULT_TRIAL) -> Metrics:
     sample = bytes(data[:DEFAULT_SAMPLE])
     trial = bytes(data[:max(8192, min(trial_size, 16384))])
-    if not trial:
-        zero = 1.0
-    else:
+    if trial:
         last, _ = _bwt(trial)
-        mtf = _mtf_encode(last)
-        zero = mtf.count(0) / len(mtf)
-    return Metrics(
-        entropy=shannon_entropy(sample),
-        repetition=consecutive_repetition_ratio(sample),
-        zero_ratio=zero,
-        signature_compressed=_signature(sample),
-        extension_hint=_extension_hint(filename),
-    )
+        zero = _mtf_encode(last).count(0) / len(trial)
+    else:
+        zero = 1.0
+    return Metrics(shannon_entropy(sample), consecutive_repetition_ratio(sample), zero, _signature(sample), _extension(filename))
 
 
-def choose_path(metrics: Metrics) -> int:
-    ext = metrics.extension_hint
-    if metrics.signature_compressed or ext in _BINARY_EXTS:
+def choose_path(m: Metrics) -> int:
+    if m.signature_compressed or m.extension_hint in _BINARY_EXTS:
         return FLAG_DIRECT
-    if ext in _TEXT_EXTS:
-        if metrics.zero_ratio >= 0.35:
-            return FLAG_BWT_MTF_RLE if metrics.zero_ratio >= 0.50 else FLAG_BWT_MTF
-        if metrics.zero_ratio < 0.15:
-            return FLAG_DIRECT
-    if metrics.entropy > 7.5 or metrics.zero_ratio < 0.15:
+    if m.entropy > 7.5 or m.zero_ratio < 0.15:
         return FLAG_DIRECT
-    if metrics.entropy < 6.0 and metrics.zero_ratio > 0.35:
-        return FLAG_BWT_MTF_RLE if metrics.zero_ratio >= 0.50 else FLAG_BWT_MTF
-    if metrics.repetition >= 0.20 and metrics.zero_ratio >= 0.25 and metrics.entropy < 7.0:
+    if m.extension_hint in _TEXT_EXTS and m.zero_ratio >= 0.35:
+        return FLAG_BWT_MTF_RLE if m.zero_ratio >= 0.50 else FLAG_BWT_MTF
+    if m.entropy < 6.0 and m.zero_ratio > 0.35:
+        return FLAG_BWT_MTF_RLE if m.zero_ratio >= 0.50 else FLAG_BWT_MTF
+    if m.repetition >= 0.20 and m.zero_ratio >= 0.25 and m.entropy < 7.0:
         return FLAG_BWT_MTF
     return FLAG_DIRECT
 
 
-def _wrap(flag: int, original_size: int, block_size: int, payload: bytes, checksum: int) -> bytes:
+def _wrap(flag: int, original_size: int, block_size: int, checksum: int, payload: bytes) -> bytes:
     return bytes((flag,)) + MAGIC + bytes((VERSION,)) + struct.pack("<III", original_size, block_size, checksum) + payload
 
 
-def _unwrap(blob: bytes) -> tuple[int, int, int, int, bytes]:
-    if len(blob) < 18 or blob[0] not in (FLAG_DIRECT, FLAG_BWT_MTF, FLAG_BWT_MTF_RLE):
+def _unwrap(blob: bytes):
+    if len(blob) < 18 or blob[0] not in (1, 2, 3) or blob[1:5] != MAGIC or blob[5] != VERSION:
         raise NotDivideEncodedError("not an Adaptive Universal BWT container")
-    if blob[1:5] != MAGIC or blob[5] != VERSION:
-        raise NotDivideEncodedError("unsupported Adaptive Universal BWT container")
     original_size, block_size, checksum = struct.unpack_from("<III", blob, 6)
     if block_size == 0 or block_size > 1 << 20:
         raise CorruptedError("invalid adaptive BWT block size")
@@ -306,24 +254,20 @@ def _unwrap(blob: bytes) -> tuple[int, int, int, int, bytes]:
 def compress(data: bytes, *, filename: str | None = None, block_size: int = DEFAULT_BWT_BLOCK, level: str = "BALANCED") -> bytes:
     from .de2 import compress as de2_compress
     src = bytes(data)
-    if not src:
-        return _wrap(FLAG_DIRECT, 0, block_size, de2_compress(b"", level=level), zlib.crc32(src) & 0xFFFFFFFF)
-    metrics = analyze(src, filename=filename)
-    selected = choose_path(metrics)
     direct = de2_compress(src, block_size=1 << 20, level=level)
-    if selected == FLAG_DIRECT:
-        return _wrap(FLAG_DIRECT, len(src), block_size, direct, zlib.crc32(src) & 0xFFFFFFFF)
-    transformed = _bwt_blocks_encode(src, block_size)
-    if selected == FLAG_BWT_MTF_RLE:
-        transformed = _rle_encode(transformed)
-    trial_payload = de2_compress(transformed, block_size=1 << 20, level=level)
-    # Never let the adaptive front-end regress against direct DE2.
-    if len(trial_payload) >= len(direct):
-        selected = FLAG_DIRECT
-        payload = direct
-    else:
-        payload = trial_payload
-    return _wrap(selected, len(src), block_size, payload, zlib.crc32(src) & 0xFFFFFFFF)
+    if not src:
+        return _wrap(FLAG_DIRECT, 0, block_size, zlib.crc32(src) & 0xFFFFFFFF, direct)
+    selected = choose_path(analyze(src, filename=filename))
+    if selected != FLAG_DIRECT:
+        transformed = _blocks_encode(src, block_size)
+        if selected == FLAG_BWT_MTF_RLE:
+            transformed = _rle_encode(transformed)
+        candidate = de2_compress(transformed, block_size=1 << 20, level=level)
+        if len(candidate) < len(direct):
+            direct = candidate
+        else:
+            selected = FLAG_DIRECT
+    return _wrap(selected, len(src), block_size, zlib.crc32(src) & 0xFFFFFFFF, direct)
 
 
 def decompress(blob: bytes, *, verify: bool = True) -> bytes:
@@ -334,31 +278,10 @@ def decompress(blob: bytes, *, verify: bool = True) -> bytes:
         data = transformed
     else:
         if flag == FLAG_BWT_MTF_RLE:
-            # RLE output length is not known independently; decode with a
-            # bounded stream parser, then BWT validates each block.
-            transformed = _rle_decode_unknown(transformed)
-        data = _bwt_blocks_decode(transformed, original_size, block_size)
+            transformed = _rle_decode(transformed)
+        data = _blocks_decode(transformed, original_size, block_size)
     if len(data) != original_size:
         raise CorruptedError("adaptive original size mismatch")
-    if verify and (zlib.crc32(data) & 0xFFFFFFFF) != checksum:
+    if verify and zlib.crc32(data) & 0xFFFFFFFF != checksum:
         raise CorruptedError("adaptive source checksum mismatch")
     return data
-
-
-def _rle_decode_unknown(data: bytes) -> bytes:
-    out = bytearray()
-    i = 0
-    while i < len(data):
-        b = data[i]
-        if b == 0:
-            if i + 2 >= len(data):
-                raise CorruptedError("truncated adaptive RLE")
-            value, run = data[i + 1], data[i + 2]
-            if run == 0:
-                raise CorruptedError("invalid adaptive RLE run")
-            out += bytes((value,)) * run
-            i += 3
-        else:
-            out.append(b)
-            i += 1
-    return bytes(out)
