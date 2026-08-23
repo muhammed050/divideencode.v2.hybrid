@@ -45,15 +45,28 @@ def _trial(kind_value: int, payload: bytes, source: bytes):
 
 
 def _normalize_de2_result(result):
-    """Accept the normal 3-tuple and tolerate legacy 4/5-value workers.
+    """Normalize DE2 worker results to ``(size, enc, dec)``.
 
-    The benchmark previously crashed when a worker returned metadata in
-    addition to size/encode/decode timing.  Keeping this normalization here
-    makes the parent process resilient while preserving the displayed metrics.
+    Older workers could return metadata before the three numeric metrics.
+    The previous implementation blindly used result[0], which turned a
+    metadata string into ``size`` and caused ``ValueError: Cannot specify ','
+    with 's'`` during formatting.  Prefer the normal numeric 3-tuple and
+    otherwise locate the first numeric size followed by numeric timings.
     """
-    if not isinstance(result, tuple) or len(result) < 3:
+    if not isinstance(result, (tuple, list)):
         raise ValueError(f"invalid DE2 result: {result!r}")
-    return result[0], result[1], result[2]
+
+    if len(result) >= 3:
+        a, b, c = result[:3]
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)) and isinstance(c, (int, float)):
+            return int(a), float(b), float(c)
+
+    for i in range(max(0, len(result) - 2)):
+        a, b, c = result[i:i + 3]
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)) and isinstance(c, (int, float)):
+            return int(a), float(b), float(c)
+
+    raise ValueError(f"invalid DE2 result shape: {result!r}")
 
 
 def main():
