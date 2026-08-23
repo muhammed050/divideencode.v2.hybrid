@@ -4,7 +4,7 @@ from divideencode.v3 import universal_binary_ir as v1
 from divideencode.v3 import ubir_v11 as v11
 from divideencode.de2 import compress
 
-CORPUS = Path(__file__).resolve().parents[1] / "corpus"
+CORPUS = Path(__file__).resolve().parent / "corpus"
 
 for name in ("json_small.json", "json_large.json"):
     data = (CORPUS / name).read_bytes()
