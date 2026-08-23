@@ -4,10 +4,9 @@ Research only: compare direct DE2 with UBIR V1.6 -> DE2 and record the
 candidate that produces the smallest DE2 output. The experiment deliberately
 treats IR size as diagnostic rather than an optimization target.
 
-This benchmark is intentionally generic at the routing layer. V1.6 itself
-currently supports JSON only, so non-JSON corpus files are measured as direct
-DE2 baselines and reported as unsupported-by-UBIR rather than being forced
-through a JSON transform.
+V1.6 is JSON-only. Direct DE2, however, requires an explicit kind, so this
+benchmark dispatches JSON/CSV by suffix and keeps unsupported formats as a
+clear direct-DE2-only baseline.
 """
 from __future__ import annotations
 import time
@@ -17,46 +16,58 @@ from divideencode.v3 import ubir_v16 as v16
 ROOT = Path(__file__).resolve().parents[1]
 CORPUS = ROOT / "benchmarks" / "corpus"
 
-try:
-    from divideencode.v3 import universal_binary_ir as de
-except ImportError:
-    de = None
+from divideencode.v3 import universal_binary_ir as de
 
-# Keep corpus discovery generic; do not hard-code JSON as the only workload.
 FILES = sorted(p for p in CORPUS.iterdir() if p.is_file())
 
 
-def de2(blob: bytes):
-    """Run the project's DE2 codec if its public API is available."""
-    # Existing V3 benchmarks expose DE2 through the top-level v1 module.
-    if hasattr(de, "encode"):
-        t = time.perf_counter()
-        packed = de.encode(blob)
-        et = time.perf_counter() - t
-        t = time.perf_counter()
-        out = de.decode(packed)
-        dt = time.perf_counter() - t
-        if out != blob:
-            raise AssertionError("DE2 roundtrip mismatch")
-        return len(packed), et, dt
-    raise RuntimeError("DE2 API not found")
+def kind_for(path: Path) -> str | None:
+    """Return the DE2/UBIR kind supported by the public universal codec."""
+    s = path.suffix.lower()
+    if s in {".json", ".jsonl"}:
+        return "json"
+    if s == ".csv":
+        return "csv"
+    return None
+
+
+def de2(blob: bytes, kind: str):
+    """Run DE2 with its required explicit input kind and verify roundtrip."""
+    t = time.perf_counter()
+    packed = de.encode(blob, kind)
+    et = time.perf_counter() - t
+    t = time.perf_counter()
+    out = de.decode(packed)
+    dt = time.perf_counter() - t
+    if out != blob:
+        raise AssertionError(f"DE2 roundtrip mismatch for kind={kind}")
+    return len(packed), et, dt
 
 
 def main():
     print("V1.7 DE2-ORIENTED ADAPTIVE ROUTING")
     print("criterion=final_DE2_size; IR_size_is_diagnostic_only")
+    print("direct DE2 dispatch: .json/.jsonl -> json, .csv -> csv")
+
     for path in FILES:
         data = path.read_bytes()
-        direct, det, ddt = de2(data)
+        kind = kind_for(path)
         print(f"\n{path.name}")
-        print(f"  direct DE2={direct:7d} B encode={det:.2f}s de2={ddt:.2f}s")
+
+        if kind is None:
+            print("  direct DE2=unsupported by universal codec")
+            print("  adaptive winner=unsupported")
+            continue
+
+        direct, det, ddt = de2(data, kind)
+        print(f"  direct DE2={direct:7d} B encode={det:.2f}s de2={ddt:.2f}s kind={kind}")
 
         # V1.6 is currently JSON-only. Never force other formats through it.
-        if path.suffix.lower() == ".json":
+        if kind == "json":
             t = time.perf_counter()
             ir = v16.encode(data, "json")
             iet = time.perf_counter() - t
-            packed, pet, pdt = de2(ir)
+            packed, pet, pdt = de2(ir, "json")
             recovered = v16.decode(ir)
             if recovered != data:
                 raise AssertionError("V1.6 roundtrip mismatch")
