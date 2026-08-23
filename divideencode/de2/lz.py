@@ -43,6 +43,8 @@ _KNUTH = 0x9E3779B1              # multiplicative hash constant
 # decode to wrong data (the format has no field to renegotiate it).
 REP_INIT = (1, 2, 4, 8)
 
+_LIT_COST = 4                    # literal bits proxy for distance-bias rule
+
 # level -> knobs; budget_floor bounds the adaptive probe budget
 # (floor == max_chain disables shrinking: BALANCED/MAX always search deep)
 _LEVEL_FAST = dict(max_chain=6, lazy=False, nice_len=24, good_len=8,
@@ -193,10 +195,18 @@ def _tokenize(data, window=DEFAULT_WINDOW, max_chain=MAX_CHAIN, lazy=LAZY,
                     if bl < limit and data[pos + bl] == data[i + bl]:
                         l = _match_length(data, pos, i, limit)
                         if l > bl:
-                            bl = l
-                            bd = i - pos
-                            if l >= nice_len or l >= limit:
-                                break
+                            nd = i - pos
+                            # v2-aware acceptance: a farther candidate must
+                            # buy back its extra distance-class bits with
+                            # literal savings (MRU chains yield near-first,
+                            # so this prunes exactly the losing tail)
+                            if bl == 0 or \
+                                    nd.bit_length() - bd.bit_length() <= \
+                                    (l - bl) * _LIT_COST:
+                                bl = l
+                                bd = nd
+                                if l >= nice_len or l >= limit:
+                                    break
                     pos = prev[pos]
                 if bl > best_len:
                     best_len = bl
