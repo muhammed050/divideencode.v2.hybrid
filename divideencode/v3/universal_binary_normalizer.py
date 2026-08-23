@@ -21,8 +21,6 @@ def _identity(data: bytes) -> bytes:
 
 
 def _delta(data: bytes) -> bytes:
-    if not data:
-        return b""
     out = bytearray(len(data))
     prev = 0
     for i, x in enumerate(data):
@@ -41,8 +39,6 @@ def _delta_inv(data: bytes) -> bytes:
 
 
 def _xor_prev(data: bytes) -> bytes:
-    if not data:
-        return b""
     out = bytearray(len(data))
     prev = 0
     for i, x in enumerate(data):
@@ -61,28 +57,26 @@ def _xor_prev_inv(data: bytes) -> bytes:
 
 
 def _nibble(data: bytes) -> bytes:
+    """Store all high nibbles followed by all low nibbles.
+
+    This intentionally expands to 2N bytes before DE2. That is acceptable for
+    the experiment because the score is final DE2 size, not IR size.
+    """
     n = len(data)
-    out = bytearray(n)
-    half = (n + 1) // 2
+    out = bytearray(2 * n)
     for i, x in enumerate(data):
-        out[i] = x >> 4 if i < half else 0
-    # For odd lengths the last low nibble occupies the final byte.
-    for i, x in enumerate(data):
-        pos = half + i
-        if pos < n:
-            out[pos] = x & 0x0F
+        out[i] = x >> 4
+        out[n + i] = x & 0x0F
     return bytes(out)
 
 
-def _nibble_inv(data: bytes) -> bytes:
-    n = len(data)
-    half = (n + 1) // 2
+def _nibble_inv(data: bytes, original_len: int) -> bytes:
+    n = original_len
+    if len(data) != 2 * n:
+        raise ValueError("UBN nibble length mismatch")
     out = bytearray(n)
     for i in range(n):
-        hi = data[i] if i < half else 0
-        lo_pos = half + i
-        lo = data[lo_pos] if lo_pos < n else 0
-        out[i] = ((hi & 0x0F) << 4) | (lo & 0x0F)
+        out[i] = ((data[i] & 0x0F) << 4) | (data[n + i] & 0x0F)
     return bytes(out)
 
 
@@ -92,7 +86,7 @@ def _bitplane(data: bytes) -> bytes:
     for off in range(0, len(data), 8):
         block = data[off:off + 8]
         if len(block) < 8:
-            block = block + b"\0" * (8 - len(block))
+            block += b"\0" * (8 - len(block))
         for bit in range(8):
             v = 0
             for j, x in enumerate(block):
@@ -106,7 +100,7 @@ def _bitplane_inv(data: bytes, original_len: int) -> bytes:
     for off in range(0, len(data), 8):
         planes = data[off:off + 8]
         if len(planes) < 8:
-            planes = planes + b"\0" * (8 - len(planes))
+            planes += b"\0" * (8 - len(planes))
         for j in range(8):
             x = 0
             for bit in range(8):
@@ -120,9 +114,8 @@ def _transpose16(data: bytes) -> bytes:
     out = bytearray()
     for off in range(0, len(data), 256):
         block = data[off:off + 256]
-        size = len(block)
-        if size < 256:
-            block += b"\0" * (256 - size)
+        if len(block) < 256:
+            block += b"\0" * (256 - len(block))
         for c in range(16):
             for r in range(16):
                 out.append(block[r * 16 + c])
@@ -147,8 +140,6 @@ def _transpose16_inv(data: bytes, original_len: int) -> bytes:
 
 def _rle8(data: bytes) -> bytes:
     """Simple count/value RLE; always reversible, useful for long runs."""
-    if not data:
-        return b""
     out = bytearray()
     i = 0
     while i < len(data):
@@ -177,7 +168,7 @@ TRANSFORMS: dict[str, tuple[int, Callable[[bytes], bytes], Callable[[bytes, int]
     "raw": (0, _identity, lambda b, n: b),
     "delta8": (1, _delta, lambda b, n: _delta_inv(b)),
     "xor8": (2, _xor_prev, lambda b, n: _xor_prev_inv(b)),
-    "nibble": (3, _nibble, lambda b, n: _nibble_inv(b)),
+    "nibble": (3, _nibble, _nibble_inv),
     "bitplane8": (4, _bitplane, _bitplane_inv),
     "transpose16": (5, _transpose16, _transpose16_inv),
     "rle8": (6, _rle8, _rle8_inv),
@@ -201,7 +192,7 @@ def unpack(blob: bytes) -> tuple[str, bytes, int]:
     magic, tid, original_len = HEADER.unpack(blob[:HEADER.size])
     if magic != MAGIC or tid not in BY_ID:
         raise ValueError("invalid UBN header")
-    name, _fn, inv = BY_ID[tid]
+    name, _fn, _inv = BY_ID[tid]
     return name, blob[HEADER.size:], original_len
 
 
