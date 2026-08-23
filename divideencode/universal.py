@@ -1,185 +1,141 @@
-"""Content-agnostic adaptive preprocessing for DE2.
+"""DU1 — one universal reversible preconditioner for DE2.
 
-The selector is intentionally extension-free. It scores generic reversible
-byte transforms by the *final DE2 size*, not by intermediate IR size.
+The project goal here is deliberately narrow: do not classify file types and
+ do not choose between a family of codecs.  DU1 applies one fixed mathematical
+ transformation to every byte stream, then gives that representation to DE2.
+
+For byte x_i, with x_-1 = 0:
+    r_i = (x_i - x_{i-1}) mod 256
+    s_i = r_i                 when r_i < 128
+          r_i - 256           otherwise
+    z_i = 2*s_i               when s_i >= 0
+          -2*s_i - 1          otherwise
+
+The signed residual is mapped by zigzag so nearby values occupy nearby small
+symbols.  The transform is exactly reversible and format-agnostic.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import zlib
 
-from .de2 import compress as de2_compress, decompress as de2_decompress
+from .bitstream import decode_varint, encode_varint
+from .errors import CorruptedError, NotDivideEncodedError
 
 MAGIC = b"DU1"
 VERSION = 1
+FLAG_TRANSFORM = 1
+FLAG_IDENTITY = 0
 
 
-@dataclass(frozen=True)
-class Candidate:
-    name: str
-    ident: int
-    data: bytes
-    transform_size: int
+def _zigzag_signed(value: int) -> int:
+    return value << 1 if value >= 0 else (-value << 1) - 1
 
 
-def _delta(data: bytes) -> bytes:
-    if not data:
-        return b""
-    out = bytearray(len(data))
+def _unzigzag(value: int) -> int:
+    return value >> 1 if not (value & 1) else -((value >> 1) + 1)
+
+
+def encode(data: bytes) -> bytes:
+    """Apply the single universal residual+zigzag transform."""
+    src = bytes(data)
+    out = bytearray(len(src))
     prev = 0
-    for i, x in enumerate(data):
-        out[i] = (x - prev) & 255
-        prev = x
+    for i, value in enumerate(src):
+        residual = (value - prev) & 0xFF
+        signed = residual if residual < 128 else residual - 256
+        out[i] = _zigzag_signed(signed)
+        prev = value
     return bytes(out)
 
 
-def _undelta(data: bytes) -> bytes:
-    out = bytearray(len(data))
+def decode(data: bytes, original_size: int | None = None) -> bytes:
+    """Reverse :func:`encode` byte-for-byte."""
+    src = bytes(data)
+    if original_size is not None and len(src) != original_size:
+        raise CorruptedError("DU1 transformed size mismatch")
+    out = bytearray(len(src))
     prev = 0
-    for i, x in enumerate(data):
-        prev = (prev + x) & 255
-        out[i] = prev
+    for i, encoded in enumerate(src):
+        value = (prev + _unzigzag(encoded)) & 0xFF
+        out[i] = value
+        prev = value
     return bytes(out)
 
 
-def _xor(data: bytes) -> bytes:
-    if not data:
-        return b""
-    out = bytearray(len(data))
-    prev = 0
-    for i, x in enumerate(data):
-        out[i] = x ^ prev
-        prev = x
+def _wrap(flags: int, original_size: int, payload: bytes, checksum: int) -> bytes:
+    out = bytearray(MAGIC)
+    out.append(VERSION)
+    out.append(flags)
+    out += encode_varint(original_size)
+    out += encode_varint(len(payload))
+    out += checksum.to_bytes(4, "little")
+    out += payload
     return bytes(out)
 
 
-def _unxor(data: bytes) -> bytes:
-    out = bytearray(len(data))
-    prev = 0
-    for i, x in enumerate(data):
-        prev ^= x
-        out[i] = prev
-    return bytes(out)
+def _unwrap(blob: bytes) -> tuple[int, int, int, bytes]:
+    if len(blob) < 9 or blob[:3] != MAGIC:
+        raise NotDivideEncodedError("not a DU1 universal container")
+    if blob[3] != VERSION:
+        raise NotDivideEncodedError("unsupported DU1 version %d" % blob[3])
+    flags = blob[4]
+    if flags not in (FLAG_IDENTITY, FLAG_TRANSFORM):
+        raise CorruptedError("unknown DU1 flags 0x%02x" % flags)
+    original_size, pos = decode_varint(blob, 5, len(blob))
+    payload_size, pos = decode_varint(blob, pos, len(blob))
+    if pos + 4 > len(blob):
+        raise CorruptedError("DU1 checksum truncated")
+    checksum = int.from_bytes(blob[pos:pos + 4], "little")
+    pos += 4
+    if payload_size != len(blob) - pos:
+        raise CorruptedError("DU1 payload size mismatch")
+    return flags, original_size, checksum, bytes(blob[pos:])
 
 
-def _bitplane(data: bytes) -> bytes:
-    n = len(data)
-    out = bytearray(n)
-    p = 0
-    for bit in range(8):
-        for x in data:
-            out[p] = (x >> bit) & 1
-            p += 1
-    return bytes(out)
+def compress(data: bytes, *, block_size: int = 1 << 20,
+             level: str = "BALANCED") -> bytes:
+    """DU1 -> DE2.
 
+    The transformed representation is always attempted first.  If DE2 makes
+    the untouched bytes smaller, DU1 records identity instead.  This is not a
+    second transform/codec; it is the lossless safety escape for data on which
+    a reversible preconditioner cannot improve DE2.
+    """
+    from .de2 import compress as de2_compress
 
-def _unbitplane(data: bytes) -> bytes:
-    n = len(data)
-    if n == 0:
-        return b""
-    if n % 8:
-        raise ValueError("invalid bitplane payload")
-    width = n // 8
-    out = bytearray(width)
-    p = 0
-    for bit in range(8):
-        for i in range(width):
-            out[i] |= (data[p] & 1) << bit
-            p += 1
-    return bytes(out)
+    src = bytes(data)
+    transformed = encode(src)
+    transformed_de2 = de2_compress(transformed, block_size=block_size,
+                                   level=level)
 
+    # Compare only against direct DE2 to prevent the universal layer from
+    # ever becoming a size regression.  The actual transform remains unique.
+    direct_de2 = de2_compress(src, block_size=block_size, level=level)
+    if len(transformed_de2) < len(direct_de2):
+        flags = FLAG_TRANSFORM
+        payload = transformed_de2
+    else:
+        flags = FLAG_IDENTITY
+        payload = direct_de2
 
-def _transpose16(data: bytes) -> bytes:
-    # Byte-matrix transpose for 16-byte rows. Tail is copied unchanged.
-    full = len(data) // 16 * 16
-    out = bytearray(full)
-    p = 0
-    for off in range(0, full, 16):
-        row = data[off:off + 16]
-        for col in range(16):
-            out[p] = row[col]
-            p += 1
-    return bytes(out) + data[full:]
-
-
-def _untranspose16(data: bytes) -> bytes:
-    full = len(data) // 16 * 16
-    out = bytearray(full)
-    p = 0
-    for off in range(0, full, 16):
-        for col in range(16):
-            out[off + col] = data[p]
-            p += 1
-    return bytes(out) + data[full:]
-
-
-def candidates(data: bytes) -> list[Candidate]:
-    """Return generic candidates; no filename/extension classification."""
-    data = bytes(data)
-    raw = [
-        Candidate("identity", 0, data, len(data)),
-        Candidate("delta8", 1, _delta(data), len(data)),
-        Candidate("xor8", 2, _xor(data), len(data)),
-        Candidate("bitplane8", 3, _bitplane(data), len(data)),
-        Candidate("transpose16", 4, _transpose16(data), len(data)),
-    ]
-    return raw
-
-
-def _inverse(ident: int, data: bytes) -> bytes:
-    if ident == 0:
-        return data
-    if ident == 1:
-        return _undelta(data)
-    if ident == 2:
-        return _unxor(data)
-    if ident == 3:
-        return _unbitplane(data)
-    if ident == 4:
-        return _untranspose16(data)
-    raise ValueError(f"unknown universal transform {ident}")
-
-
-def _pack(ident: int, original_size: int, transformed: bytes) -> bytes:
-    return MAGIC + bytes((VERSION, ident)) + original_size.to_bytes(8, "little") + transformed
-
-
-def _unpack(payload: bytes) -> tuple[int, int, bytes]:
-    if len(payload) < 13 or payload[:3] != MAGIC or payload[3] != VERSION:
-        raise ValueError("invalid universal DE2 payload")
-    return payload[4], int.from_bytes(payload[5:13], "little"), payload[13:]
-
-
-def compress(data: bytes, *, max_candidates: int = 5) -> tuple[bytes, dict]:
-    """Select the smallest final DE2 stream among generic reversible transforms."""
-    data = bytes(data)
-    best_blob = None
-    best = None
-    for cand in candidates(data)[:max_candidates]:
-        packed = _pack(cand.ident, len(data), cand.data)
-        blob = de2_compress(packed)
-        # Verify every candidate before it can win.
-        decoded = de2_decompress(blob)
-        ident, original_size, transformed = _unpack(decoded)
-        if original_size != len(data) or _inverse(ident, transformed) != data:
-            continue
-        if best_blob is None or len(blob) < len(best_blob):
-            best_blob = blob
-            best = cand
-    if best_blob is None:
-        raise ValueError("no valid universal candidate")
-    return best_blob, {
-        "transform": best.name,
-        "transform_id": best.ident,
-        "original_size": len(data),
-        "final_size": len(best_blob),
-        "ir_size": best.transform_size,
-    }
+    return _wrap(flags, len(src), payload, zlib.crc32(src) & 0xFFFFFFFF)
 
 
 def decompress(blob: bytes, *, verify: bool = True) -> bytes:
-    decoded = de2_decompress(blob, verify=verify)
-    ident, original_size, transformed = _unpack(decoded)
-    data = _inverse(ident, transformed)
-    if len(data) != original_size:
-        raise ValueError("universal decoded size mismatch")
+    """DE2 -> DU1 inverse -> original bytes."""
+    from .de2 import decompress as de2_decompress
+
+    flags, original_size, checksum, payload = _unwrap(bytes(blob))
+    transformed = de2_decompress(payload, verify=verify)
+    if len(transformed) != original_size:
+        raise CorruptedError("DU1 original size mismatch")
+    data = decode(transformed, original_size) if flags == FLAG_TRANSFORM else transformed
+    if verify and (zlib.crc32(data) & 0xFFFFFFFF) != checksum:
+        raise CorruptedError("DU1 source checksum mismatch")
     return data
+
+
+def transform_ratio(data: bytes) -> float:
+    """Return transformed-byte size / source-byte size (always 1.0 for non-empty input)."""
+    src = bytes(data)
+    return 1.0 if src else 1.0
