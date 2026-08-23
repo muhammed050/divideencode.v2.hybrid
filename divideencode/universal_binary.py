@@ -175,8 +175,8 @@ def _candidate_pool(data: bytes, mode: SearchMode) -> list[Kind]:
     text_ratio = _textlike(sample)
     entropy = _entropy(sample)
 
-    # Do not proxy-reject DELTA/XOR for text/source-like data: their LZ gain
-    # can survive despite higher entropy. The DE2 sample gate is authoritative.
+    # DELTA/XOR are deliberately retained for text/source-like inputs. Their
+    # usefulness is decided by the DE2 sample, not by a byte-frequency proxy.
     if text_ratio < 0.70:
         base = _proxy(sample)
         candidates = [
@@ -233,11 +233,17 @@ def _guided_candidates(
 
     sample = src[:sample_size]
     direct_sample_size = len(de2_compress(sample, level="BALANCED"))
+    textlike = _textlike(sample) >= 0.70
     scored: list[tuple[int, Kind]] = []
     for kind in pool:
         transformed = transform(sample, kind)
         size = len(de2_compress(transformed, level="BALANCED"))
-        if size <= direct_sample_size * (1.0 - _SAMPLE_MIN_GAIN):
+        # For source/text, DELTA/XOR are cheap enough to measure and must not
+        # be discarded merely because the small sample misses a 2% threshold.
+        # Final full-input DE2 remains the only acceptance criterion.
+        if textlike and kind in (Kind.DELTA8, Kind.XOR8):
+            scored.append((size, kind))
+        elif size <= direct_sample_size * (1.0 - _SAMPLE_MIN_GAIN):
             scored.append((size, kind))
 
     scored.sort(key=lambda x: (x[0], int(x[1])))
