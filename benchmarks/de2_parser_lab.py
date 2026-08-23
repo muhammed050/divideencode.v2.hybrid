@@ -1,13 +1,14 @@
 """DE2 parser laboratory.
 
 This benchmark is intentionally read-only with respect to production code. It
-compares tokenizer configurations on the same inputs and records both parser
-statistics and final DE2 payload size.
+compares tokenizer configurations on the same inputs and records parser
+statistics plus a cheap token-cost proxy. It does not change production
+encoding decisions.
 
 Examples:
     python benchmarks/de2_parser_lab.py
     python benchmarks/de2_parser_lab.py --samples samples --out parser_lab.json
-    python benchmarks/de2_parser_lab.py --sizes 8,16,32,64 --csv parser_lab.csv
+    python benchmarks/de2_parser_lab.py --chains 8,16,32,64 --csv parser_lab.csv
 """
 from __future__ import annotations
 
@@ -19,14 +20,13 @@ import random
 import struct
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from divideencode.v2.lz import tokenize, token_stats
-from divideencode.v2.codec import _lze_core
 
 
 @dataclass(frozen=True)
@@ -71,21 +71,17 @@ def run_case(case: Case, max_chain: int, lazy: bool) -> dict:
     tokens = tokenize(data, max_chain=max_chain, lazy=lazy)
     tokenize_ms = (time.perf_counter() - t0) * 1000.0
     stats = token_stats(tokens)
-
-    t1 = time.perf_counter()
-    lze = _lze_core(data)
-    lze_ms = (time.perf_counter() - t1) * 1000.0
-    lze_size = None if lze is None else len(lze)
+    n = len(data)
+    match_pct = 0.0 if not n else 100.0 * stats["match_covered"] / n
 
     return {
         "case": case.name,
-        "input_bytes": len(data),
+        "input_bytes": n,
         "max_chain": max_chain,
         "lazy": lazy,
         "tokenize_ms": round(tokenize_ms, 3),
-        "lze_ms": round(lze_ms, 3),
-        "lze_bytes": lze_size,
-        "lze_ratio": None if lze_size is None or not data else round(lze_size / len(data), 6),
+        "match_covered_pct": round(match_pct, 3),
+        "tokens_per_kib": round(stats["tokens"] * 1024 / max(1, n), 3),
         **stats,
     }
 
@@ -129,16 +125,14 @@ def main() -> int:
           (len(cases), len(chains) * 2, len(rows)))
     print("output=%s" % args.out)
     print()
-    print("case                         chain lazy  tokens   match%%  LZE bytes   tokenize ms")
-    print("---------------------------  ----- ----  -------  -------  ---------  -----------")
+    print("case                         chain lazy  tokens   match%%  tok/KB   tokenize ms")
+    print("---------------------------  ----- ----  -------  -------  -------  -----------")
     for row in rows:
         if row["case"].startswith("sample:") or row["case"] in {"json", "u16", "random"}:
-            covered = row["match_covered"]
-            match_pct = 0.0 if not row["input_bytes"] else 100.0 * covered / row["input_bytes"]
-            print("%-27s  %5d %4s  %7d  %6.1f  %9s  %11.3f" % (
+            print("%-27s  %5d %4s  %7d  %6.1f  %7.2f  %11.3f" % (
                 row["case"][:27], row["max_chain"], str(row["lazy"]),
-                row["tokens"], match_pct,
-                str(row["lze_bytes"]), row["tokenize_ms"]))
+                row["tokens"], row["match_covered_pct"],
+                row["tokens_per_kib"], row["tokenize_ms"]))
     return 0
 
 
