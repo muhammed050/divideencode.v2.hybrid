@@ -1,7 +1,7 @@
 """UBIR2 -- fast universal binary representation search for DE2.
 
-The IR is intentionally allowed to grow.  The only objective is the final
-DE2 container size.  A cheap sample pass ranks reversible transforms, then
+The IR is intentionally allowed to grow. The only objective is the final
+DE2 container size. A cheap sample pass ranks reversible transforms, then
 only the most promising transforms are materialized and sent through DE2.
 DIRECT is always encoded as the baseline and is always eligible to win.
 
@@ -14,7 +14,6 @@ import struct
 import zlib
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Callable
 
 from .errors import CorruptedError, NotDivideEncodedError
 from .universal_ir import Kind, transform, inverse
@@ -48,6 +47,20 @@ class Result:
     de2_size: int
     ir_size: int
     candidates_tested: int
+
+
+def _normalize_mode(mode: SearchMode | str) -> SearchMode:
+    if isinstance(mode, SearchMode):
+        return mode
+    if isinstance(mode, str):
+        try:
+            return SearchMode[mode.upper()]
+        except KeyError as exc:
+            raise ValueError(f"unknown UBIR2 search mode: {mode!r}; expected FAST, BALANCED, or MAX") from exc
+    try:
+        return SearchMode(mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid UBIR2 search mode: {mode!r}") from exc
 
 
 def _entropy(data: bytes) -> float:
@@ -132,8 +145,9 @@ def _sample_transform(data: bytes, kind: Kind) -> bytes:
     return transform(data, kind)
 
 
-def rank_candidates(data: bytes, *, mode: SearchMode = SearchMode.BALANCED) -> list[Kind]:
+def rank_candidates(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED) -> list[Kind]:
     """Return only likely DE2-friendly transforms, without running DE2."""
+    mode = _normalize_mode(mode)
     sample = bytes(data[: 256 * 1024])
     if not sample:
         return [Kind.DIRECT]
@@ -182,10 +196,10 @@ def _unpack(blob: bytes) -> tuple[Kind, int, int, bytes]:
     return Kind(kind), original_size, crc, payload
 
 
-def compress(data: bytes, *, mode: SearchMode = SearchMode.BALANCED, level: str = "BALANCED", block_size: int = 1 << 20) -> bytes:
+def compress(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, level: str = "BALANCED", block_size: int = 1 << 20) -> bytes:
     """Compress using DIRECT plus at most 1/2/3 promising UBIR transforms.
 
-    The final winner is always selected by the actual DE2 byte length.  The
+    The final winner is always selected by the actual DE2 byte length. The
     representation itself is never required to be smaller than the source.
     """
     from .de2 import compress as de2_compress
@@ -203,7 +217,7 @@ def compress(data: bytes, *, mode: SearchMode = SearchMode.BALANCED, level: str 
     return _pack(best_kind, len(src), zlib.crc32(src) & 0xFFFFFFFF, best_blob)
 
 
-def compress_with_stats(data: bytes, *, mode: SearchMode = SearchMode.BALANCED, level: str = "BALANCED", block_size: int = 1 << 20) -> Result:
+def compress_with_stats(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, level: str = "BALANCED", block_size: int = 1 << 20) -> Result:
     from .de2 import compress as de2_compress
     src = bytes(data)
     kinds = rank_candidates(src, mode=mode)
