@@ -5,197 +5,168 @@ from the tree; whitespace at grammar boundaries and original lexical spellings
 are retained so decode(encode(x)) is byte-exact.
 """
 from __future__ import annotations
-
 import re
 from collections import Counter
+MAGIC=b"BJSON"; VERSION=1
+T_OBJECT,T_ARRAY,T_STRING,T_INT,T_FLOAT,T_TRUE,T_FALSE,T_NULL,T_KEY_REF=range(1,10)
+_WS=re.compile(rb"[ \t\r\n]*"); _STR=re.compile(rb'"(?:\\.|[^"\\])*"'); _NUM=re.compile(rb'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
 
-MAGIC = b"BJSON"
-VERSION = 1
-T_OBJECT, T_ARRAY, T_STRING, T_INT, T_FLOAT, T_TRUE, T_FALSE, T_NULL, T_KEY_REF = range(1, 10)
-_WS = re.compile(rb"[ \t\r\n]*")
-_STR = re.compile(rb'"(?:\\.|[^"\\])*"')
-_NUM = re.compile(rb'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
-
-
-def u(n: int) -> bytes:
-    if n < 0: raise ValueError("negative varint")
-    out = bytearray()
-    while n >= 128:
-        out.append((n & 127) | 128); n >>= 7
-    out.append(n); return bytes(out)
-
-
-def r(data: bytes, p: int):
-    n = 0; shift = 0
-    while p < len(data):
-        b = data[p]; p += 1; n |= (b & 127) << shift
-        if not b & 128: return n, p
-        shift += 7
+def u(n):
+    if n<0: raise ValueError("negative varint")
+    o=bytearray()
+    while n>=128:o.append((n&127)|128);n>>=7
+    o.append(n);return bytes(o)
+def r(d,p):
+    n=0;s=0
+    while p<len(d):
+        b=d[p];p+=1;n|=(b&127)<<s
+        if not b&128:return n,p
+        s+=7
     raise ValueError("truncated varint")
+def s(x):return u(len(x))+x
+def g(d,p):
+    n,p=r(d,p);e=p+n
+    if e>len(d):raise ValueError("truncated bytes")
+    return d[p:e],e
+def zz(n):return n<<1 if n>=0 else ((-n<<1)-1)
+def uzz(n):return n>>1 if not n&1 else -((n>>1)+1)
 
-
-def s(x: bytes) -> bytes: return u(len(x)) + x
-
-
-def g(data: bytes, p: int):
-    n, p = r(data, p); e = p + n
-    if e > len(data): raise ValueError("truncated bytes")
-    return data[p:e], e
-
-
-def zz(n: int) -> int: return n << 1 if n >= 0 else ((-n << 1) - 1)
-
-
-def uzz(n: int) -> int: return n >> 1 if not n & 1 else -((n >> 1) + 1)
-
-
-def _lex(data: bytes):
-    p = 0; out = []
-    while p < len(data):
-        m = _WS.match(data, p); ws = m.group(0); p = m.end()
-        if p >= len(data): return out, ws
-        c = data[p:p+1]
-        if c in b"{}[]:,": tok = c; p += 1
-        elif c == b'"':
-            m = _STR.match(data, p)
-            if not m: raise ValueError("invalid JSON string")
-            tok = m.group(0); p = m.end()
-        elif data.startswith(b"true", p): tok = b"true"; p += 4
-        elif data.startswith(b"false", p): tok = b"false"; p += 5
-        elif data.startswith(b"null", p): tok = b"null"; p += 4
+def _lex(d):
+    p=0;o=[]
+    while p<len(d):
+        m=_WS.match(d,p);ws=m.group(0);p=m.end()
+        if p>=len(d):return o,ws
+        c=d[p:p+1]
+        if c in b"{}[]:,":tok=c;p+=1
+        elif c==b'"':
+            m=_STR.match(d,p)
+            if not m:raise ValueError("invalid JSON string")
+            tok=m.group(0);p=m.end()
+        elif d.startswith(b"true",p):tok=b"true";p+=4
+        elif d.startswith(b"false",p):tok=b"false";p+=5
+        elif d.startswith(b"null",p):tok=b"null";p+=4
         else:
-            m = _NUM.match(data, p)
-            if not m: raise ValueError("invalid JSON token")
-            tok = m.group(0); p = m.end()
-        out.append((ws, tok))
-    return out, b""
-
+            m=_NUM.match(d,p)
+            if not m:raise ValueError("invalid JSON token")
+            tok=m.group(0);p=m.end()
+        o.append((ws,tok))
+    return o,b""
 
 class _Parser:
-    def __init__(self, toks): self.t = toks; self.i = 0
-    def peek(self): return self.t[self.i][1] if self.i < len(self.t) else None
+    def __init__(self,t):self.t=t;self.i=0
+    def peek(self):return self.t[self.i][1] if self.i<len(self.t) else None
     def take(self):
-        if self.i >= len(self.t): raise ValueError("unexpected EOF")
-        x = self.t[self.i]; self.i += 1; return x
-
+        if self.i>=len(self.t):raise ValueError("unexpected EOF")
+        x=self.t[self.i];self.i+=1;return x
     def value(self):
-        ws, tok = self.take()
-        if tok == b'{':
-            fields = []
-            if self.peek() == b'}':
-                close = self.take(); return ("obj", ws, fields, close[0])
+        ws,tok=self.take()
+        if tok==b'{':
+            fs=[]
+            if self.peek()==b'}':c=self.take();return("obj",ws,fs,c[0])
             while True:
-                kws, key = self.take()
-                if not key.startswith(b'"') or self.peek() != b':': raise ValueError("invalid object")
-                cws, _ = self.take()
-                val = self.value()
-                comma_ws = None
-                if self.peek() == b',':
-                    comma_ws, _ = self.take()
-                    if self.peek() == b'}': raise ValueError("trailing object comma")
-                fields.append((kws, key, cws, val, comma_ws))
+                kws,key=self.take()
+                if not key.startswith(b'"') or self.peek()!=b':':raise ValueError("invalid object")
+                cws,_=self.take();val=self.value();comma_ws=None
+                if self.peek()==b',':comma_ws,_=self.take()
+                fs.append((kws,key,cws,val,comma_ws))
                 if comma_ws is None:
-                    if self.peek() != b'}': raise ValueError("missing object comma")
-                    close = self.take(); return ("obj", ws, fields, close[0])
-        if tok == b'[':
-            vals = []
-            if self.peek() == b']':
-                close = self.take(); return ("arr", ws, vals, close[0])
+                    if self.peek()!=b'}':raise ValueError("missing object comma")
+                    c=self.take();return("obj",ws,fs,c[0])
+                if self.peek()==b'}':raise ValueError("trailing object comma")
+        if tok==b'[':
+            vs=[]
+            if self.peek()==b']':c=self.take();return("arr",ws,vs,c[0])
             while True:
-                val = self.value(); comma_ws = None
-                if self.peek() == b',':
-                    comma_ws, _ = self.take()
-                    if self.peek() == b']': raise ValueError("trailing array comma")
-                vals.append((val, comma_ws))
+                val=self.value();comma_ws=None
+                if self.peek()==b',':comma_ws,_=self.take()
+                vs.append((val,comma_ws))
                 if comma_ws is None:
-                    if self.peek() != b']': raise ValueError("missing array comma")
-                    close = self.take(); return ("arr", ws, vals, close[0])
-        if tok.startswith(b'"'): return ("str", ws, tok)
-        if tok == b"true": return ("true", ws)
-        if tok == b"false": return ("false", ws)
-        if tok == b"null": return ("null", ws)
-        if b'.' in tok or b'e' in tok.lower(): return ("float", ws, tok)
-        return ("int", ws, int(tok), tok)
+                    if self.peek()!=b']':raise ValueError("missing array comma")
+                    c=self.take();return("arr",ws,vs,c[0])
+                if self.peek()==b']':raise ValueError("trailing array comma")
+        if tok.startswith(b'"'):return("str",ws,tok)
+        if tok==b"true":return("true",ws)
+        if tok==b"false":return("false",ws)
+        if tok==b"null":return("null",ws)
+        if b'.' in tok or b'e' in tok.lower():return("float",ws,tok)
+        return("int",ws,int(tok),tok)
 
+def _collect_keys(n,o):
+    if n[0]=="obj":
+        for f in n[2]:o.append(f[1]);_collect_keys(f[3],o)
+    elif n[0]=="arr":
+        for v,_ in n[2]:_collect_keys(v,o)
 
-def _collect_keys(node, out):
-    if node[0] == "obj":
-        for f in node[2]: out.append(f[1]); _collect_keys(f[3], out)
-    elif node[0] == "arr":
-        for v, _ in node[2]: _collect_keys(v, out)
+def _enc_node(n,ids):
+    k=n[0];o=bytearray()
+    if k=="obj":
+        o+=bytes([T_OBJECT])+s(n[1])+u(len(n[2]))
+        for kws,key,cws,v,cw in n[2]:
+            kid=ids.get(key)
+            o+=bytes([T_KEY_REF])+s(kws)+u(kid+1 if kid is not None else 0)
+            if kid is None:o+=s(key)
+            o+=s(cws)+_enc_node(v,ids)+s(cw or b"")
+        o+=s(n[3])
+    elif k=="arr":
+        o+=bytes([T_ARRAY])+s(n[1])+u(len(n[2]))
+        for v,cw in n[2]:o+=_enc_node(v,ids)+s(cw or b"")
+        o+=s(n[3])
+    elif k=="str":o+=bytes([T_STRING])+s(n[1])+s(n[2])
+    elif k=="int":o+=bytes([T_INT])+s(n[1])+u(zz(n[2]))
+    elif k=="float":o+=bytes([T_FLOAT])+s(n[1])+s(n[2])
+    elif k=="true":o+=bytes([T_TRUE])+s(n[1])
+    elif k=="false":o+=bytes([T_FALSE])+s(n[1])
+    elif k=="null":o+=bytes([T_NULL])+s(n[1])
+    return bytes(o)
 
+def encode(d):
+    t,tr=_lex(d);p=_Parser(t);root=p.value()
+    if p.i!=len(t):raise ValueError("trailing JSON tokens")
+    keys=[];_collect_keys(root,keys);cnt=Counter(keys)
+    dic=sorted((k for k,n in cnt.items() if n>=2),key=lambda x:(-cnt[x]*len(x),x));ids={k:i for i,k in enumerate(dic)}
+    payload=bytearray(u(len(dic)))
+    for k in dic:payload+=s(k)
+    payload+=_enc_node(root,ids)+s(tr)
+    return MAGIC+bytes([VERSION])+u(len(d))+bytes(payload)
 
-def _enc_node(node, key_ids):
-    k = node[0]; out = bytearray()
-    if k == "obj":
-        out += bytes([T_OBJECT]) + s(node[1]) + u(len(node[2]))
-        for kws, key, cws, val, comma_ws in node[2]:
-            out += bytes([T_KEY_REF]) + s(kws) + u(key_ids.get(key, 0)) + s(cws)
-            if key not in key_ids: out += s(key)
-            out += _enc_node(val, key_ids) + s(comma_ws or b"")
-        out += s(node[3])
-    elif k == "arr":
-        out += bytes([T_ARRAY]) + s(node[1]) + u(len(node[2]))
-        for val, comma_ws in node[2]: out += _enc_node(val, key_ids) + s(comma_ws or b"")
-        out += s(node[3])
-    elif k == "str": out += bytes([T_STRING]) + s(node[1]) + s(node[2])
-    elif k == "int": out += bytes([T_INT]) + s(node[1]) + u(zz(node[2]))
-    elif k == "float": out += bytes([T_FLOAT]) + s(node[1]) + s(node[2])
-    elif k == "true": out += bytes([T_TRUE]) + s(node[1])
-    elif k == "false": out += bytes([T_FALSE]) + s(node[1])
-    elif k == "null": out += bytes([T_NULL]) + s(node[1])
-    return bytes(out)
-
-
-def encode(data: bytes) -> bytes:
-    toks, trailing = _lex(data); parser = _Parser(toks); root = parser.value()
-    if parser.i != len(toks): raise ValueError("trailing JSON tokens")
-    keys = []; _collect_keys(root, keys); counts = Counter(keys)
-    dictionary = sorted((k for k, n in counts.items() if n >= 2), key=lambda x: (-counts[x] * len(x), x))
-    key_ids = {k: i for i, k in enumerate(dictionary)}
-    payload = bytearray(u(len(dictionary)))
-    for k in dictionary: payload += s(k)
-    payload += _enc_node(root, key_ids) + s(trailing)
-    return MAGIC + bytes([VERSION]) + u(len(data)) + bytes(payload)
-
-
-def _dec_node(data: bytes, p: int, dictionary):
-    tag = data[p]; p += 1; ws, p = g(data, p); out = bytearray(ws)
-    if tag == T_OBJECT:
-        n, p = r(data, p); out += b'{'
+def _dec_node(d,p,dic):
+    tag=d[p];p+=1;ws,p=g(d,p);o=bytearray(ws)
+    if tag==T_OBJECT:
+        n,p=r(d,p);o+=b'{'
         for i in range(n):
-            kt, p = data[p], p + 1
-            if kt != T_KEY_REF: raise ValueError("bad key tag")
-            kws, p = g(data, p); kid, p = r(data, p); cws, p = g(data, p)
-            if kid >= len(dictionary):
-                key, p = g(data, p)
+            kt=d[p];p+=1
+            if kt!=T_KEY_REF:raise ValueError("bad key tag")
+            kws,p=g(d,p);kid,p=r(d,p)
+            if kid==0:key,p=g(d,p)
             else:
-                key = dictionary[kid]
-            v, p = _dec_node(data, p, dictionary); comma_ws, p = g(data, p)
-            out += kws + key + cws + b':' + v
-            if comma_ws or i + 1 < n: out += comma_ws + (b',' if i + 1 < n else b'')
-        close, p = g(data, p); out += close + b'}'
-    elif tag == T_ARRAY:
-        n, p = r(data, p); out += b'['
+                kid-=1
+                if kid>=len(dic):raise ValueError("bad key reference")
+                key=dic[kid]
+            cws,p=g(d,p);v,p=_dec_node(d,p,dic);cw,p=g(d,p)
+            o+=kws+key+cws+b':'+v
+            if i+1<n:o+=cw+b','
+            elif cw:o+=cw
+        close,p=g(d,p);o+=close+b'}'
+    elif tag==T_ARRAY:
+        n,p=r(d,p);o+=b'['
         for i in range(n):
-            v, p = _dec_node(data, p, dictionary); comma_ws, p = g(data, p); out += v
-            if comma_ws or i + 1 < n: out += comma_ws + (b',' if i + 1 < n else b'')
-        close, p = g(data, p); out += close + b']'
-    elif tag == T_STRING: x, p = g(data, p); out += x
-    elif tag == T_INT: z, p = r(data, p); out += str(uzz(z)).encode()
-    elif tag == T_FLOAT: x, p = g(data, p); out += x
-    elif tag == T_TRUE: out += b'true'
-    elif tag == T_FALSE: out += b'false'
-    elif tag == T_NULL: out += b'null'
-    else: raise ValueError("unknown binary JSON tag")
-    return bytes(out), p
+            v,p=_dec_node(d,p,dic);cw,p=g(d,p);o+=v
+            if i+1<n:o+=cw+b','
+            elif cw:o+=cw
+        close,p=g(d,p);o+=close+b']'
+    elif tag==T_STRING:x,p=g(d,p);o+=x
+    elif tag==T_INT:z,p=r(d,p);o+=str(uzz(z)).encode()
+    elif tag==T_FLOAT:x,p=g(d,p);o+=x
+    elif tag==T_TRUE:o+=b'true'
+    elif tag==T_FALSE:o+=b'false'
+    elif tag==T_NULL:o+=b'null'
+    else:raise ValueError("unknown binary JSON tag")
+    return bytes(o),p
 
-
-def decode(blob: bytes) -> bytes:
-    if len(blob) < 6 or blob[:5] != MAGIC or blob[5] != VERSION: raise ValueError("invalid BJSON")
-    raw, p = r(blob, 6); nd, p = r(blob, p); dictionary = []
-    for _ in range(nd):
-        x, p = g(blob, p); dictionary.append(x)
-    out, p = _dec_node(blob, p, dictionary); trailing, p = g(blob, p); out += trailing
-    if p != len(blob) or len(out) != raw: raise ValueError("BJSON length mismatch")
+def decode(blob):
+    if len(blob)<6 or blob[:5]!=MAGIC or blob[5]!=VERSION:raise ValueError("invalid BJSON")
+    raw,p=r(blob,6);nd,p=r(blob,p);dic=[]
+    for _ in range(nd):x,p=g(blob,p);dic.append(x)
+    out,p=_dec_node(blob,p,dic);tr,p=g(blob,p);out+=tr
+    if p!=len(blob) or len(out)!=raw:raise ValueError("BJSON length mismatch")
     return out
