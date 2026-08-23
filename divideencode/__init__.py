@@ -1,6 +1,7 @@
 from .encoder import compress, recursive_compress, MAGIC as CONTAINER_MAGIC, VERSION
 from .decoder import decompress, decompress_with_trace, parse_header
 from .universal import compress as universal_compress, decompress as universal_decompress
+from .adaptive_universal import compress as adaptive_compress, decompress as adaptive_decompress
 from .errors import DivideEncodeError, CorruptedError, NotDivideEncodedError
 from .strategies import render_trace
 
@@ -11,6 +12,8 @@ __all__ = [
     "decompress",
     "universal_compress",
     "universal_decompress",
+    "adaptive_compress",
+    "adaptive_decompress",
     "decompress_with_trace",
     "parse_header",
     "recursive_compress",
