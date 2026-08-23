@@ -30,9 +30,11 @@ def _encode_block(data, max_chain=lz.MAX_CHAIN, lazy=lz.LAZY, level=None):
     payload = None
     tmeta = b""
 
-    # One universal phrase decision. The sample selector chooses one phrase
-    # length (or none); the complete block is then translated exactly once.
-    phrase_eligible = mode in (MODE_LZ, MODE_STRUCT_LZ)
+    # Phrase translation is a structural representation. Do not let it
+    # change ordinary plain-text blocks from MODE_LZ: the core DE2 classifier
+    # contract requires ordinary printable text to use the direct LZ path.
+    # Structured text remains eligible for the phrase frontend.
+    phrase_eligible = mode == MODE_STRUCT_LZ
     phrase_eligible = phrase_eligible and len(data) >= 64
     phrase_eligible = phrase_eligible and fs.printable_frac >= 0.70
     phrase_eligible = phrase_eligible and fs.match_density >= 0.01
