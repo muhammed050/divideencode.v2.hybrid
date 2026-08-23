@@ -1,10 +1,7 @@
 """Compositional Structural Engine v3.
 
-The v2 structural engine chooses one transform.  v3 searches short reversible
-pipelines, because a useful representation is often a composition such as
-integer-delta -> RLE or dictionary -> RLE.  The engine is conservative: every
-candidate is lossless, has explicit metadata, and adaptive mode compares the
-complete representation with RAW using the supplied downstream scorer.
+Bounded search over reversible structural transforms. v3 allows short
+compositions instead of forcing exactly one structural transform.
 """
 from __future__ import annotations
 
@@ -13,13 +10,10 @@ import struct
 
 MAGIC = b"SV3"
 _VERSION = 1
-
-# step ids are deliberately stable; never recycle an id.
 STEP_DELTA = 1
 STEP_RLE = 2
 STEP_DICT = 3
 STEP_PLANE = 4
-
 
 @dataclass(frozen=True)
 class Step:
@@ -27,13 +21,11 @@ class Step:
     meta: bytes
     payload: bytes
 
-
 @dataclass(frozen=True)
 class Candidate:
     kinds: tuple[str, ...]
     blob: bytes
     size: int
-
 
 @dataclass(frozen=True)
 class Decision:
@@ -63,19 +55,17 @@ def _read_varint(buf: bytes, p: int = 0) -> tuple[int, int]:
         b = buf[p]
         p += 1
         n |= (b & 0x7F) << shift
-        if not (b & 0x80):
+        if not b & 0x80:
             return n, p
         shift += 7
 
 
 def _svarint(x: int) -> bytes:
-    # Python integers are arbitrary precision; this is the canonical ZigZag form.
-    u = (x << 1) if x >= 0 else ((-x << 1) - 1)
-    return _varint(u)
+    return _varint((x << 1) if x >= 0 else ((-x << 1) - 1))
 
 
 def _read_svarints(buf: bytes, count: int) -> list[int]:
-    out: list[int] = []
+    out = []
     p = 0
     for _ in range(count):
         u, p = _read_varint(buf, p)
@@ -87,31 +77,22 @@ def _read_svarints(buf: bytes, count: int) -> list[int]:
 
 def _delta_step(data: bytes):
     best = None
-    for width, fmts in (
-        (1, ("B",)),
-        (2, ("<H", ">H")),
-        (4, ("<I", ">I")),
-        (8, ("<Q", ">Q")),
-    ):
+    for width, fmts in ((1, ("B",)), (2, ("<H", ">H")),
+                        (4, ("<I", ">I")), (8, ("<Q", ">Q"))):
         if len(data) < width * 8 or len(data) % width:
             continue
         for fmt in fmts:
             vals = [x[0] for x in struct.iter_unpack(fmt, data)]
-            prev = 0
             packed = bytearray()
-            for v in vals:
-                packed.extend(_svarint(v - prev))
-                prev = v
-            # Store original format and count so reconstruction is exact.
+            prev = 0
+            for value in vals:
+                packed.extend(_svarint(value - prev))
+                prev = value
             fb = fmt.encode("ascii")
             meta = bytes((width, len(fb))) + fb + _varint(len(vals))
-            overhead = len(_varint(len(meta))) + len(meta) + 4
-            size = overhead + len(packed)
-            if size >= len(data):
-                continue
-            item = (size, Step(STEP_DELTA, meta, bytes(packed)), ("delta",))
-            if best is None or size < best[0]:
-                best = item
+            size = 5 + len(_varint(len(meta))) + len(meta) + len(packed)
+            if size < len(data) and (best is None or size < best[0]):
+                best = size, Step(STEP_DELTA, meta, bytes(packed)), ("delta",)
     return best
 
 
@@ -129,10 +110,11 @@ def _rle_step(data: bytes):
         packed.extend(_varint(j - i))
         runs += 1
         i = j
-    if len(packed) + 4 >= len(data):
-        return None
     meta = _varint(runs)
-    return len(meta) + len(packed) + 4, Step(STEP_RLE, meta, bytes(packed)), ("rle",)
+    size = 5 + len(meta) + len(packed)
+    if size >= len(data):
+        return None
+    return size, Step(STEP_RLE, meta, bytes(packed)), ("rle",)
 
 
 def _dict_step(data: bytes):
@@ -140,8 +122,8 @@ def _dict_step(data: bytes):
     for width in (2, 3, 4, 5, 6, 8, 12, 16, 24, 32):
         if len(data) < width * 16 or len(data) % width:
             continue
-        table: dict[bytes, int] = {}
-        dictionary: list[bytes] = []
+        table = {}
+        dictionary = []
         ids = bytearray()
         for p in range(0, len(data), width):
             chunk = data[p:p + width]
@@ -158,16 +140,13 @@ def _dict_step(data: bytes):
             meta.extend(_varint(len(dictionary)))
             for chunk in dictionary:
                 meta.extend(chunk)
-            size = len(meta) + len(ids) + 4
+            size = 5 + len(meta) + len(ids)
             if size < len(data) and (best is None or size < best[0]):
                 best = size, Step(STEP_DICT, bytes(meta), bytes(ids)), ("dict",)
     return best
 
 
 def _plane_step(data: bytes):
-    # Transposition alone is neutral in byte count; v3 only emits it when a
-    # following transform makes it useful.  The caller therefore treats it as
-    # a candidate intermediate rather than a final representation.
     for width in (2, 4, 8, 16):
         if len(data) < width * 16 or len(data) % width:
             continue
@@ -183,31 +162,33 @@ def _plane_step(data: bytes):
     return None
 
 
-def _apply_raw_step(data: bytes, kind: int):
+def _apply_step(data: bytes, kind: int):
     if kind == STEP_DELTA:
         x = _delta_step(data)
-        return None if x is None else (x[1], x[2], x[0])
-    if kind == STEP_RLE:
+    elif kind == STEP_RLE:
         x = _rle_step(data)
-        return None if x is None else (x[1], x[2], x[0])
-    if kind == STEP_DICT:
+    elif kind == STEP_DICT:
         x = _dict_step(data)
-        return None if x is None else (x[1], x[2], x[0])
-    return None
+    else:
+        return None
+    if x is None:
+        return None
+    return x[1], x[2], x[0]
 
 
-def _step_blob(step: Step) -> bytes:
-    return bytes((step.kind,)) + _varint(len(step.meta)) + step.meta + step.payload
-
-
-def _make_blob(steps: list[Step]) -> bytes:
-    body = bytearray()
-    body.extend(bytes((_VERSION, len(steps))))
+def _encode_pipeline(steps: list[Step]) -> bytes:
+    body = bytearray((_VERSION, len(steps)))
     for step in steps:
-        body.extend(_step_blob(step))
-    # The final bytes are the payload of the last step.  Earlier steps contain
-    # their own payload, making the stream a self-contained transformation log.
+        body.append(step.kind)
+        body.extend(_varint(len(step.meta)))
+        body.extend(step.meta)
+        body.extend(_varint(len(step.payload)))
+        body.extend(step.payload)
     return MAGIC + bytes(body)
+
+
+def _raw_blob(data: bytes) -> bytes:
+    return MAGIC + bytes((_VERSION, 0)) + _varint(len(data)) + data
 
 
 def _decode_step(step: Step) -> bytes:
@@ -215,18 +196,16 @@ def _decode_step(step: Step) -> bytes:
     if step.kind == STEP_DELTA:
         if len(step.meta) < 2:
             raise ValueError("invalid delta metadata")
-        width, flen = step.meta[0], step.meta[1]
-        fs, fe = 2, 2 + flen
+        width, flen = step.meta[:2]
+        fe = 2 + flen
         if fe > len(step.meta):
             raise ValueError("truncated delta metadata")
-        fmt = step.meta[fs:fe].decode("ascii")
+        fmt = step.meta[2:fe].decode("ascii")
         count, q = _read_varint(step.meta, fe)
         if q != len(step.meta):
             raise ValueError("trailing delta metadata")
-        deltas = _read_svarints(data, count)
-        vals = []
-        total = 0
-        for d in deltas:
+        vals, total = [], 0
+        for d in _read_svarints(data, count):
             total += d
             vals.append(total)
         if width == 1:
@@ -242,15 +221,14 @@ def _decode_step(step: Step) -> bytes:
         runs, q = _read_varint(step.meta)
         if q != len(step.meta):
             raise ValueError("invalid rle metadata")
-        out = bytearray()
-        p = 0
+        out, p = bytearray(), 0
         for _ in range(runs):
             if p >= len(data):
                 raise ValueError("truncated rle payload")
-            b = data[p]
+            value = data[p]
             p += 1
-            n, p = _read_varint(data, p)
-            out.extend(bytes((b,)) * n)
+            count, p = _read_varint(data, p)
+            out.extend(bytes((value,)) * count)
         if p != len(data):
             raise ValueError("trailing rle payload")
         return bytes(out)
@@ -280,8 +258,7 @@ def _decode_step(step: Step) -> bytes:
             raise ValueError("invalid plane metadata")
         if len(data) != width * count:
             raise ValueError("invalid plane payload")
-        out = bytearray(len(data))
-        p = 0
+        out, p = bytearray(len(data)), 0
         for b in range(width):
             for r in range(count):
                 out[r * width + b] = data[p]
@@ -291,25 +268,20 @@ def _decode_step(step: Step) -> bytes:
     raise ValueError("unknown structural v3 step")
 
 
-def _encode_pipeline(original: bytes, steps: list[Step]) -> bytes:
-    # A step stores the output of that step. Decode therefore walks backwards.
-    # RAW is implicit: inverse reconstructs from the last payload and reverses
-    # every operation in reverse order.
-    body = bytearray((_VERSION, len(steps)))
-    for s in steps:
-        body.extend(_step_blob(s))
-    return MAGIC + bytes(body)
-
-
 def inverse(blob: bytes) -> bytes:
     if len(blob) < 5 or blob[:3] != MAGIC:
         raise ValueError("invalid structural v3 stream")
-    version = blob[3]
-    if version != _VERSION:
+    if blob[3] != _VERSION:
         raise ValueError("unsupported structural v3 version")
     count = blob[4]
     p = 5
-    steps: list[Step] = []
+    if count == 0:
+        size, p = _read_varint(blob, p)
+        end = p + size
+        if end != len(blob):
+            raise ValueError("invalid raw structural stream")
+        return blob[p:end]
+    steps = []
     for _ in range(count):
         if p >= len(blob):
             raise ValueError("truncated structural v3 stream")
@@ -318,69 +290,37 @@ def inverse(blob: bytes) -> bytes:
         mlen, p = _read_varint(blob, p)
         end = p + mlen
         if end > len(blob):
-            raise ValueError("truncated structural v3 metadata")
+            raise ValueError("truncated structural metadata")
         meta = blob[p:end]
-        payload_start = end
-        # Payload boundaries are explicit for every step by storing payload
-        # length before payload.  Old blobs are rejected rather than guessed.
-        plen, p2 = _read_varint(blob, payload_start)
-        pend = p2 + plen
-        if pend > len(blob):
-            raise ValueError("truncated structural v3 payload")
-        steps.append(Step(kind, meta, blob[p2:pend]))
-        p = pend
+        p = end
+        plen, p = _read_varint(blob, p)
+        end = p + plen
+        if end > len(blob):
+            raise ValueError("truncated structural payload")
+        steps.append(Step(kind, meta, blob[p:end]))
+        p = end
     if p != len(blob):
-        raise ValueError("trailing structural v3 bytes")
-    if not steps:
-        return b""
+        raise ValueError("trailing structural bytes")
     data = steps[-1].payload
     for step in reversed(steps):
-        # The final step payload is already its output; inverse of a step
-        # reconstructs its input. For intermediate steps this is exactly the
-        # previous step's output.
         data = _decode_step(Step(step.kind, step.meta, data))
     return data
 
 
-def _encode_pipeline(steps: list[Step]) -> bytes:
-    body = bytearray((_VERSION, len(steps)))
-    for s in steps:
-        body.extend(bytes((s.kind,)))
-        body.extend(_varint(len(s.meta)))
-        body.extend(s.meta)
-        body.extend(_varint(len(s.payload)))
-        body.extend(s.payload)
-    return MAGIC + bytes(body)
-
-
-def _raw_blob(data: bytes) -> bytes:
-    return MAGIC + bytes((_VERSION, 0)) + _varint(len(data)) + data
-
-
-def _single_candidates(data: bytes):
-    for kind in (STEP_DELTA, STEP_RLE, STEP_DICT):
-        x = _apply_raw_step(data, kind)
-        if x is not None:
-            step, names, size = x
-            yield names, _encode_pipeline([step])
-
-
 def analyze(data: bytes, max_depth: int = 2) -> list[Candidate]:
-    """Search a bounded transform graph and return candidates by byte size."""
-    seen: set[bytes] = set()
-    candidates: list[Candidate] = []
-    queue: list[tuple[bytes, list[Step], tuple[str, ...], int]] = [(data, [], (), 0)]
-
+    if max_depth < 1:
+        return []
+    candidates, seen = [], set()
+    queue = [(data, [], (), 0)]
     while queue:
         current, steps, names, depth = queue.pop(0)
         if depth >= max_depth:
             continue
         for kind in (STEP_DELTA, STEP_RLE, STEP_DICT):
-            x = _apply_raw_step(current, kind)
+            x = _apply_step(current, kind)
             if x is None:
                 continue
             step, step_names, _ = x
-            nxt = step.payload
             new_steps = steps + [step]
             new_names = names + step_names
             blob = _encode_pipeline(new_steps)
@@ -388,29 +328,28 @@ def analyze(data: bytes, max_depth: int = 2) -> list[Candidate]:
                 continue
             seen.add(blob)
             candidates.append(Candidate(new_names, blob, len(blob)))
-            # Do not allow an unbounded graph; each intermediate must shrink.
-            if len(nxt) < len(current) and len(new_steps) < max_depth:
-                queue.append((nxt, new_steps, new_names, depth + 1))
+            if len(step.payload) < len(current) and depth + 1 < max_depth:
+                queue.append((step.payload, new_steps, new_names, depth + 1))
 
-    # Plane is an intermediate only. Apply it and then the normal transforms.
     plane = _plane_step(data)
     if plane is not None and max_depth >= 2:
-        step, names, plane_data = plane
+        first, names, plane_data = plane
         for kind in (STEP_DELTA, STEP_RLE, STEP_DICT):
-            x = _apply_raw_step(plane_data, kind)
+            x = _apply_step(plane_data, kind)
             if x is None:
                 continue
             second, second_names, _ = x
-            blob = _encode_pipeline([step, second])
-            candidates.append(Candidate(names + second_names, blob, len(blob)))
-
+            blob = _encode_pipeline([first, second])
+            if blob not in seen:
+                seen.add(blob)
+                candidates.append(Candidate(names + second_names, blob, len(blob)))
     candidates.sort(key=lambda c: c.size)
     return candidates
 
 
 def transform(data: bytes, max_depth: int = 2) -> bytes:
-    candidates = analyze(data, max_depth=max_depth)
     raw = _raw_blob(data)
+    candidates = analyze(data, max_depth=max_depth)
     return candidates[0].blob if candidates and candidates[0].size < len(raw) else raw
 
 
