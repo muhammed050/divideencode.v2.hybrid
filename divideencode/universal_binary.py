@@ -1,4 +1,9 @@
-"""UBIR2 -- adaptive universal binary representation search for DE2."""
+"""UBIR2 -- universal representation compiler for DE2.
+
+UBIR2 is intentionally not a compressor. It searches reversible
+representations whose resulting bytes are easier for DE2 to encode. The
+intermediate representation may grow; only final DE2 size is authoritative.
+"""
 from __future__ import annotations
 
 import struct
@@ -13,7 +18,6 @@ MAGIC = b"UB2D"
 VERSION = 1
 _HEADER = struct.Struct("<4sBBHQQII")
 _DIRECT_SEARCH_CUTOFF = 0.10
-_SAMPLE_MIN_GAIN = 0.02
 
 
 class SearchMode(IntEnum):
@@ -63,13 +67,8 @@ def _entropy(data: bytes) -> float:
     for b in data:
         counts[b] += 1
     n = len(data)
-    entropy = 0.0
     import math
-    for c in counts:
-        if c:
-            p = c / n
-            entropy -= p * math.log2(p)
-    return entropy
+    return -sum((c / n) * math.log2(c / n) for c in counts if c)
 
 
 def _ratio_equal(data: bytes) -> float:
@@ -110,31 +109,12 @@ def analyze(data: bytes, *, sample_size: int = 256 * 1024) -> Analysis:
     xor = _xor_sample(sample)
     bitplane = _bitplane_sample(sample)
     return Analysis(
-        len(sample),
-        _entropy(sample),
-        _zero_ratio(sample),
-        _ratio_equal(sample),
-        _zero_ratio(delta),
-        _zero_ratio(xor),
-        _ratio_equal(bitplane),
+        len(sample), _entropy(sample), _zero_ratio(sample), _ratio_equal(sample),
+        _zero_ratio(delta), _zero_ratio(xor), _ratio_equal(bitplane),
     )
 
 
-def _proxy(data: bytes) -> float:
-    if not data:
-        return 0.0
-    sample = data[: min(len(data), 64 * 1024)]
-    counts = [0] * 256
-    for b in sample:
-        counts[b] += 1
-    concentration = sum(c * c for c in counts) / len(sample)
-    zeros = sample.count(0) / len(sample)
-    runs = _ratio_equal(sample)
-    return 1.0 / (1.0 + concentration * 0.015 + zeros * 2.5 + runs * 4.0)
-
-
 def _column_similarity(data: bytes, width: int) -> float:
-    """Estimate whether a fixed stride has correlated byte columns."""
     if width <= 1 or len(data) < width * 8:
         return 0.0
     columns: list[list[int]] = [[0] * 256 for _ in range(width)]
@@ -143,73 +123,66 @@ def _column_similarity(data: bytes, width: int) -> float:
         c = i % width
         columns[c][b] += 1
         counts[c] += 1
-    similarity = 0.0
-    pairs = 0
+    total = pairs = 0.0
     for a in range(width - 1):
-        ca = counts[a]
-        if not ca:
-            continue
         for b in range(a + 1, width):
-            cb = counts[b]
-            if not cb:
+            if not counts[a] or not counts[b]:
                 continue
-            overlap = sum(min(columns[a][v] / ca, columns[b][v] / cb) for v in range(256))
-            similarity += overlap
+            total += sum(min(columns[a][v] / counts[a], columns[b][v] / counts[b]) for v in range(256))
             pairs += 1
-    return similarity / pairs if pairs else 0.0
+    return total / pairs if pairs else 0.0
 
 
 def _textlike(data: bytes) -> float:
     if not data:
         return 0.0
-    printable = sum(1 for b in data if b in (9, 10, 13) or 32 <= b <= 126)
-    return printable / len(data)
+    return sum(1 for b in data if b in (9, 10, 13) or 32 <= b <= 126) / len(data)
 
 
 def _candidate_pool(data: bytes, mode: SearchMode) -> list[Kind]:
+    """Build a search plan, never a compression verdict.
+
+    The old proxy rejected transforms before DE2 measured them. That defeats
+    the purpose of a representation compiler: two streams with similar byte
+    statistics can select completely different DE2 modes. In particular it
+    could reject XOR8 even when XOR8 produced a much smaller DE2 stream.
+
+    Structural statistics are now used only to ORDER candidates. The actual
+    DE2 size is the only quality signal used by the search.
+    """
     sample = bytes(data[:256 * 1024])
     if not sample:
         return []
 
-    candidates = [Kind.DELTA8, Kind.XOR8, Kind.BITPLANE, Kind.TRANSPOSE4, Kind.TRANSPOSE8]
-    text_ratio = _textlike(sample)
+    all_kinds = [
+        Kind.DELTA8, Kind.XOR8, Kind.NIBBLE, Kind.BITPLANE,
+        Kind.TRANSPOSE4, Kind.TRANSPOSE8,
+        Kind.STRIDE2, Kind.STRIDE4, Kind.STRIDE8,
+    ]
+    text = _textlike(sample) >= 0.70
     entropy = _entropy(sample)
+    zero_delta = _zero_ratio(_delta_sample(sample))
+    zero_xor = _zero_ratio(_xor_sample(sample))
+    column = max(_column_similarity(sample, 2), _column_similarity(sample, 4), _column_similarity(sample, 8))
 
-    # DELTA/XOR are deliberately retained for text/source-like inputs. Their
-    # usefulness is decided by the DE2 sample, not by a byte-frequency proxy.
-    if text_ratio < 0.70:
-        base = _proxy(sample)
-        candidates = [
-            kind for kind in candidates
-            if kind in (Kind.DELTA8, Kind.XOR8)
-            or _proxy(transform(sample, kind)) < base * 0.99
-        ]
+    priority: dict[Kind, float] = {k: 100.0 for k in all_kinds}
+    priority[Kind.DELTA8] -= zero_delta * 40.0
+    priority[Kind.XOR8] -= zero_xor * 40.0
+    priority[Kind.NIBBLE] -= max(
+        sum((b & 0x0F) == 0 for b in sample) / len(sample),
+        sum((b >> 4) == 0 for b in sample) / len(sample),
+    ) * 20.0
+    for k in (Kind.STRIDE2, Kind.STRIDE4, Kind.STRIDE8):
+        priority[k] -= column * 15.0
+    if text:
+        priority[Kind.XOR8] -= 10.0
+        priority[Kind.DELTA8] -= 8.0
+    if entropy > 7.5:
+        priority[Kind.BITPLANE] += 5.0
 
-    for width, threshold, kind in (
-        (2, 0.58, Kind.STRIDE2),
-        (4, 0.62, Kind.STRIDE4),
-        (8, 0.66, Kind.STRIDE8),
-    ):
-        similarity = _column_similarity(sample, width)
-        if similarity >= threshold and (text_ratio >= 0.70 or entropy >= 5.0):
-            candidates.append(kind)
-
-    low_nibble = sum((b & 0x0F) == 0 for b in sample) / len(sample)
-    high_nibble = sum((b >> 4) == 0 for b in sample) / len(sample)
-    if max(low_nibble, high_nibble) >= 0.20:
-        candidates.append(Kind.NIBBLE)
-
-    base = _proxy(sample)
-    scored: list[tuple[float, Kind]] = []
-    for kind in candidates:
-        transformed = transform(sample, kind)
-        score = _proxy(transformed) * (len(transformed) / len(sample))
-        if kind in (Kind.DELTA8, Kind.XOR8) or score < base * 1.02:
-            scored.append((score, kind))
-    scored.sort(key=lambda x: (x[0], int(x[1])))
-
-    pool_limit = {SearchMode.FAST: 1, SearchMode.BALANCED: 2, SearchMode.MAX: 3}[mode]
-    return [kind for _score, kind in scored[:max(pool_limit, 2)]]
+    ordered = sorted(all_kinds, key=lambda k: (priority[k], int(k)))
+    limits = {SearchMode.FAST: 3, SearchMode.BALANCED: 6, SearchMode.MAX: len(all_kinds)}
+    return ordered[:limits[mode]]
 
 
 def _guided_candidates(
@@ -224,7 +197,7 @@ def _guided_candidates(
     src = bytes(data)
     if not src:
         return []
-    if direct_size is not None and direct_size / len(src) <= _DIRECT_SEARCH_CUTOFF:
+    if mode != SearchMode.MAX and direct_size is not None and direct_size / len(src) <= _DIRECT_SEARCH_CUTOFF:
         return []
 
     pool = _candidate_pool(src, mode)
@@ -232,28 +205,19 @@ def _guided_candidates(
         return []
 
     sample = src[:sample_size]
-    direct_sample_size = len(de2_compress(sample, level="BALANCED"))
-    textlike = _textlike(sample) >= 0.70
-    scored: list[tuple[int, Kind]] = []
+    measured: list[tuple[int, Kind]] = []
     for kind in pool:
         transformed = transform(sample, kind)
         size = len(de2_compress(transformed, level="BALANCED"))
-        # For source/text, DELTA/XOR are cheap enough to measure and must not
-        # be discarded merely because the small sample misses a 2% threshold.
-        # Final full-input DE2 remains the only acceptance criterion.
-        if textlike and kind in (Kind.DELTA8, Kind.XOR8):
-            scored.append((size, kind))
-        elif size <= direct_sample_size * (1.0 - _SAMPLE_MIN_GAIN):
-            scored.append((size, kind))
+        measured.append((size, kind))
 
-    scored.sort(key=lambda x: (x[0], int(x[1])))
-    if not scored:
-        return []
-    best_size = scored[0][0]
+    measured.sort(key=lambda x: (x[0], int(x[1])))
     if mode == SearchMode.FAST:
-        return [scored[0][1]]
-    close = [kind for size, kind in scored if size <= best_size * 1.02]
-    return close[:2 if mode == SearchMode.BALANCED else 3]
+        return [measured[0][1]]
+    if mode == SearchMode.BALANCED:
+        best = measured[0][0]
+        return [kind for size, kind in measured if size <= best * 1.05][:3]
+    return [kind for _size, kind in measured]
 
 
 def rank_candidates(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, direct_size: int | None = None) -> list[Kind]:
