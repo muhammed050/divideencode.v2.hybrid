@@ -14,6 +14,29 @@ structured source -> UBIR -> DE2
 
 The system keeps a direct DE2 path and selects UBIR only when the final packed result is smaller.
 
+## FROZEN RESEARCH BASELINE — UBIR V1.1
+
+UBIR V1.1 is now the **frozen research baseline** for subsequent V3 JSON experiments. It is not automatically promoted to production; future candidates must beat it while preserving byte-exact roundtrip and acceptable runtime.
+
+### Frozen final-DE2 targets
+
+| File | Direct DE2 | UBIR V1.1 | Improvement vs direct | Improvement vs V1 |
+|---|---:|---:|---:|---:|
+| `json_small.json` | 5,451 B | **5,292 B** | -159 B (-2.92%) | -57 B (-1.07%) |
+| `json_large.json` | 195,944 B | **148,990 B** | -46,954 B (-23.96%) | -1,555 B (-1.03%) |
+
+The primary benchmark target is therefore:
+
+```text
+json_large.json: 148,990 B
+```
+
+A candidate that reaches 148,990 B but does not beat it is **not considered a new winner**. The next target is `< 148,990 B`, with an initial research goal of `< 145,000 B`.
+
+### Frozen baseline verification
+
+`benchmarks/v3_ubir_baseline_v11.py` verifies both frozen final-DE2 sizes and performs byte-exact roundtrip before accepting the baseline.
+
 ## Design implemented
 
 ### JSON -> UBIR V1
@@ -70,8 +93,6 @@ UBIR + DE2    =   150,545 B
 improvement   =   -45,399 B (-23.17%)
 ```
 
-This is the key experimental result. UBIR itself is not smaller than the source, but it produces a representation that DE2 compresses substantially better.
-
 ### json_small.json — UBIR V1
 
 ```text
@@ -79,8 +100,6 @@ direct DE2    = 5,451 B
 UBIR + DE2    = 5,349 B
 improvement   = -102 B (-1.87%)
 ```
-
-The small gain confirms that UBIR must remain optional and final-size-selected.
 
 ### data.csv — UBIR V1
 
@@ -112,107 +131,107 @@ The important architectural conclusion is:
 
 ## Binary JSON V2 experiment
 
-A typed-tree Binary JSON V2 prototype was evaluated as a separate research candidate. It represented JSON as typed nodes such as OBJECT, ARRAY, STRING, INTEGER, FLOAT, TRUE/FALSE, NULL and dictionary references.
-
-Results:
+A typed-tree Binary JSON V2 prototype was evaluated as a separate research candidate.
 
 | File | Direct DE2 | Binary JSON V2 | Change vs direct |
 |---|---:|---:|---:|
 | `json_small.json` | 5,451 B | 6,241 B | +790 B (+14.49%) |
 | `json_large.json` | 195,944 B | 206,678 B | +10,734 B (+5.48%) |
 
-Conclusion: **Binary JSON V2 was rejected as a production candidate.** The typed-tree representation did not create a DE2-friendly statistical stream and was substantially worse than UBIR V1.
-
-The experiment is useful because it shows that simply making JSON "binary" or semantically typed is not enough. The representation must be optimized for the downstream entropy coder.
+Conclusion: **Binary JSON V2 was rejected as a production candidate.**
 
 ## Compact Statistical JSON IR experiment
-
-A second prototype was tested. It reduced lexical overhead and separated structural information, dictionaries and numeric data more aggressively.
-
-Results:
 
 | File | Source | Direct DE2 | Compact IR | Final DE2 | Change vs direct |
 |---|---:|---:|---:|---:|---:|
 | `json_small.json` | 29,780 B | 5,451 B | 27,095 B | 6,267 B | +816 B (+14.97%) |
 | `json_large.json` | 1,206,806 B | 195,944 B | 958,081 B | **172,801 B** | **-23,143 B (-11.81%)** |
 
-Conclusion: **Compact Statistical JSON IR is a partial success but does not beat UBIR V1.** On `json_large.json`, it improves Direct DE2 by 11.81%, but remains 22,256 B larger than the UBIR V1 result of 150,545 B.
+Conclusion: **Compact Statistical JSON IR is a partial success but does not beat UBIR V1.1.**
 
-An important observation is that the Compact IR is much smaller as an intermediate representation (958,081 B versus UBIR V1's 1,372,316 B), yet its final DE2 result is worse. Therefore intermediate IR size is not a valid optimization target; **final DE2 size remains the governing metric**.
+## Hybrid Statistical JSON IR experiment
+
+A separated structure/text + integer-stream prototype was also tested:
+
+| File | Direct DE2 | UBIR V1 | Hybrid IR | Change vs direct |
+|---|---:|---:|---:|---:|
+| `json_small.json` | 5,451 B | 5,349 B | 6,731 B | +1,280 B (+23.48%) |
+| `json_large.json` | 195,944 B | 150,545 B | **190,971 B** | -4,973 B (-2.54%) |
+
+Conclusion: the separated-stream design was rejected. It introduced too much intermediate/structural overhead and did not approach UBIR V1.
+
+## UBIR V1.1 result
+
+UBIR V1.1 keeps the successful Dictionary + Delta architecture while reducing representation overhead.
+
+Observed benchmark:
+
+```text
+json_small.json
+Direct   = 5,451 B
+UBIR V1  = 5,349 B
+UBIR V1.1= 5,292 B
+
+json_large.json
+Direct   = 195,944 B
+UBIR V1  = 150,545 B
+UBIR V1.1= 148,990 B
+```
+
+For `json_large.json`, V1.1 improves over V1 by **1,555 B (1.03%)** and over Direct DE2 by **46,954 B (23.96%)**.
+
+The V1.1 intermediate representation is also smaller than V1 on the large file:
+
+```text
+V1 IR   = 1,372,316 B
+V1.1 IR = 1,192,315 B
+```
 
 ## Current ranking on json_large.json
 
 ```text
 Direct DE2              195,944 B
-Compact Statistical IR  172,801 B   (-11.81%)
-UBIR V1                 150,545 B   (-23.17%)  <-- current best
+Hybrid Statistical IR   190,971 B
+Compact Statistical IR  172,801 B
+UBIR V1                 150,545 B
+UBIR V1.1               148,990 B  <-- FROZEN WINNER
 ```
 
-## Current limitations
+## Research rules from this point
 
-1. JSON UBIR V1 is primarily a lexical token stream and has metadata/punctuation overhead.
-2. The current UBIR intermediate representation can be larger than the original JSON, even when its final DE2 result is much smaller.
-3. Typed-tree Binary JSON V2 did not improve compression and is not selected.
-4. Compact Statistical JSON IR improved Direct DE2 but did not beat UBIR V1.
-5. CSV transforms have not yet demonstrated a gain on the current benchmark corpus.
-6. No claim is made that this design is free of patent coverage; it is an independent research implementation.
+1. UBIR V1.1 is the frozen baseline.
+2. Every new candidate must pass `decode(encode(data)) == data`.
+3. Final DE2 size, not intermediate IR size, decides compression quality.
+4. A candidate must be **strictly smaller than 148,990 B** on `json_large.json` to become the new winner.
+5. Candidates must also be evaluated on `json_small.json` and the wider corpus before any production promotion.
+6. No experimental candidate may silently replace the direct DE2 fallback.
+7. Encoding/decoding cost must be reported alongside size.
 
-## Next research direction: Hybrid Statistical JSON IR
+## Next research target
 
-The next candidate should not be another generic binary tree. The evidence points toward a **hybrid statistical representation** that preserves the successful properties of UBIR V1 while reducing its overhead.
+The next candidate is **UBIR V1.2**, focused on micro-optimizations to the V1.1 representation rather than another wholesale JSON format redesign.
 
-Target architecture:
+Initial target:
 
 ```text
-JSON
-  -> key dictionary
-  -> string dictionary
-  -> structural stream
-  -> independent integer streams
-  -> adaptive absolute/Delta coding per stream
-  -> ZigZag + Varint
-  -> DE2
+< 145,000 B on json_large.json
 ```
 
-The key research questions are:
+Longer-term target:
 
-1. Can integer Delta be applied independently to related numeric streams rather than one global sequence?
-2. Can key references and repeated string references be encoded as compact symbol streams?
-3. Can structural punctuation be represented implicitly without losing byte-exact reconstruction?
-4. Can the exact whitespace and lexical spelling side information remain compressible?
-5. Can the hybrid representation beat **150,545 B** on `json_large.json` without harming fallback behavior?
+```text
+< 140,000 B
+```
 
 ## Exactness requirement
 
-All structured transforms must preserve the project's byte-exact requirement:
+All structured transforms must preserve:
 
 ```text
- decode(encode(data)) == data
+decode(encode(data)) == data
 ```
 
 Semantic equivalence alone is insufficient. Formatting whitespace, original string lexical forms, number lexical forms, and other bytes needed to reconstruct the original file must be preserved or represented by an exact-mode side channel.
-
-## Selector architecture
-
-No experimental transform should replace the direct path automatically. The intended architecture is:
-
-```text
-Direct DE2
-      |
-      +-- UBIR V1 lexical
-      |
-      +-- Binary JSON V2 (research / rejected)
-      |
-      +-- Compact Statistical JSON IR (research)
-      |
-      +-- Hybrid Statistical JSON IR (next)
-      |
-      +--> DE2 each candidate
-               |
-               +--> select smallest final stream
-```
-
-A candidate is production-worthy only when it is byte-exact, produces a smaller final DE2 result on relevant data, has acceptable encoding/decoding cost, and safely falls back when it is not beneficial.
 
 ## Research principle
 
