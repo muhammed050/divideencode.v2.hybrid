@@ -1,14 +1,9 @@
 """UBIR1 — Universal Binary Intermediate Representation for DE2.
 
 This layer is a reversible *representation compiler*, not a compressor.
-Arbitrary bytes are rewritten into DE2-friendly layouts.  The representation
+Arbitrary bytes are rewritten into DE2-friendly layouts. The representation
 is allowed to grow; the downstream DE2 stage decides whether the rewrite was
 worthwhile.
-
-The first implementation deliberately uses generic transforms only:
-DIRECT, DELTA8, XOR8, NIBBLE_PLANES, BIT_PLANES and 4x4/8x8 byte transposes.
-No filename/type assumptions are required, so the same IR can be used for
-text, source code, structured data and opaque binary data.
 """
 from __future__ import annotations
 
@@ -28,6 +23,9 @@ class Kind(IntEnum):
     BITPLANE = 4
     TRANSPOSE4 = 5
     TRANSPOSE8 = 6
+    STRIDE2 = 7
+    STRIDE4 = 8
+    STRIDE8 = 9
 
 
 @dataclass(frozen=True)
@@ -74,7 +72,6 @@ def _xor_decode(src: bytes) -> bytes:
 
 
 def _nibble_encode(src: bytes) -> bytes:
-    """Separate every byte into a low-nibble plane and a high-nibble plane."""
     n = len(src)
     out = bytearray(2 * n)
     for i, b in enumerate(src):
@@ -96,11 +93,6 @@ def _nibble_decode(src: bytes, original_size: int | None = None) -> bytes:
 
 
 def _bitplane_encode(src: bytes) -> bytes:
-    """Transpose each 8-byte group into eight bit-plane bytes.
-
-    A partial final group is padded to eight source bytes.  The container's
-    original-size field tells the inverse exactly how much to trim.
-    """
     n = len(src)
     if not src:
         return b""
@@ -136,7 +128,6 @@ def _bitplane_decode(src: bytes, original_size: int | None = None) -> bytes:
 
 
 def _transpose(src: bytes, width: int) -> bytes:
-    """Transpose complete width x width byte matrices; leave partial tail raw."""
     block_size = width * width
     out = bytearray(src)
     for base in range(0, len(src) - block_size + 1, block_size):
@@ -147,8 +138,41 @@ def _transpose(src: bytes, width: int) -> bytes:
 
 
 def _transpose_decode(src: bytes, width: int) -> bytes:
-    # Matrix transpose is its own inverse.
     return _transpose(src, width)
+
+
+def _stride_encode(src: bytes, width: int) -> bytes:
+    """Group bytes by position modulo *width*, preserving length exactly.
+
+    This exposes repeated columns/fields that are separated by a fixed byte
+    stride. It is particularly useful for regular text/source records and
+    fixed-width binary structures. The tail is naturally handled by the
+    modulo grouping, so no padding or sidecar is required.
+    """
+    if width <= 1 or len(src) < width:
+        return bytes(src)
+    return b"".join(src[offset::width] for offset in range(width))
+
+
+def _stride_decode(src: bytes, width: int, original_size: int | None = None) -> bytes:
+    if width <= 1 or len(src) < width:
+        out = bytes(src)
+    else:
+        n = len(src)
+        lengths = [(n + width - 1 - i) // width for i in range(width)]
+        groups = []
+        pos = 0
+        for length in lengths:
+            groups.append(src[pos:pos + length])
+            pos += length
+        out_buf = bytearray(n)
+        positions = [0] * width
+        for i in range(n):
+            group = i % width
+            out_buf[i] = groups[group][positions[group]]
+            positions[group] += 1
+        out = bytes(out_buf)
+    return out if original_size is None else out[:original_size]
 
 
 def transform(src: bytes, kind: Kind) -> bytes:
@@ -167,6 +191,12 @@ def transform(src: bytes, kind: Kind) -> bytes:
         return _transpose(src, 4)
     if kind == Kind.TRANSPOSE8:
         return _transpose(src, 8)
+    if kind == Kind.STRIDE2:
+        return _stride_encode(src, 2)
+    if kind == Kind.STRIDE4:
+        return _stride_encode(src, 4)
+    if kind == Kind.STRIDE8:
+        return _stride_encode(src, 8)
     raise ValueError(f"unknown UBIR kind: {kind}")
 
 
@@ -186,18 +216,18 @@ def inverse(src: bytes, kind: Kind, *, original_size: int | None = None) -> byte
         out = _transpose_decode(src, 4)
     elif kind == Kind.TRANSPOSE8:
         out = _transpose_decode(src, 8)
+    elif kind == Kind.STRIDE2:
+        return _stride_decode(src, 2, original_size)
+    elif kind == Kind.STRIDE4:
+        return _stride_decode(src, 4, original_size)
+    elif kind == Kind.STRIDE8:
+        return _stride_decode(src, 8, original_size)
     else:
         raise ValueError(f"unknown UBIR kind: {kind}")
     return out if original_size is None else out[:original_size]
 
 
 def _score(data: bytes) -> float:
-    """Cheap DE2-friendliness score; lower is better.
-
-    This is only a ranking proxy.  It intentionally avoids calling DE2, so
-    trying several IRs remains cheap.  It rewards concentration in a few byte
-    values, low-valued symbols and adjacent repetition.
-    """
     if not data:
         return 0.0
     sample = data[: min(len(data), 256 * 1024)]
@@ -207,13 +237,11 @@ def _score(data: bytes) -> float:
     repeated = sum(c * c for c in counts) / len(sample)
     low = sum(1 for b in sample if b < 16) / len(sample)
     runs = sum(sample[i] == sample[i - 1] for i in range(1, len(sample))) / max(1, len(sample) - 1)
-    # Include size softly: an IR that grows substantially must earn that cost.
     size_penalty = len(data) / max(1, len(sample))
     return (len(sample) / (1.0 + repeated * 0.02 + low * 2.0 + runs * 4.0)) * size_penalty
 
 
 def rank(src: bytes, *, include_direct: bool = True) -> list[Candidate]:
-    """Build all universal representations without running DE2."""
     src = bytes(src)
     kinds = list(Kind)
     if not include_direct:
