@@ -8,6 +8,7 @@ from .universal_ir import Kind, transform, inverse
 
 IR_MAGIC = b"UBIR"
 IR_VERSION = 2
+_BITPLANE_MAGIC = b"BP2\x00"
 
 class Op(IntEnum):
     RAW=0; DELTA8=1; XOR8=2; NIBBLE=3; BITPLANE=4; TRANSPOSE4=5; TRANSPOSE8=6
@@ -61,18 +62,44 @@ def _rle_decode(src):
 
 def _lanes_encode(src,width): return b"".join(src[i::width] for i in range(width))
 def _lanes_decode(src,width,original_size):
-    n=original_size; lengths=[(n+width-1-i)//width for i in range(width)]; groups=[]; pos=0
+    n=original_size
+    if n<0: raise IRFormatError("invalid lane original size")
+    if len(src)!=n: raise IRFormatError("lane payload size mismatch")
+    lengths=[(n+width-1-i)//width for i in range(width)]
+    groups=[]; pos=0
     for length in lengths: groups.append(src[pos:pos+length]); pos+=length
-    if pos!=len(src): raise IRFormatError("lane payload size mismatch")
     out=bytearray(n); offsets=[0]*width
     for i in range(n):
         lane=i%width; out[i]=groups[lane][offsets[lane]]; offsets[lane]+=1
     return bytes(out)
 
+def _bitplane_encode_compiler(src):
+    """Encode BITPLANE with an exact source-size header.
+
+    The underlying transform pads the final partial 8-byte block.  A
+    compiler-level size header makes BITPLANE safe inside arbitrary composed
+    pipelines, including when another variable-length transform such as RLE
+    appears before or after it.
+    """
+    return _BITPLANE_MAGIC + struct.pack("<Q", len(src)) + transform(src, Kind.BITPLANE)
+
+def _bitplane_decode_compiler(src):
+    if len(src)<12 or src[:4]!=_BITPLANE_MAGIC:
+        raise IRFormatError("invalid BITPLANE IR header")
+    original_size=struct.unpack_from("<Q",src,4)[0]
+    body=src[12:]
+    return inverse(body, Kind.BITPLANE, original_size=original_size)
+
 def _apply_one(src,op,decode=False,original_size=None):
     if op==Op.RAW:return bytes(src)
-    if op in (Op.DELTA8,Op.XOR8,Op.NIBBLE,Op.BITPLANE,Op.TRANSPOSE4,Op.TRANSPOSE8,Op.STRIDE2,Op.STRIDE4,Op.STRIDE8):
+    if op==Op.BITPLANE:
+        return _bitplane_decode_compiler(bytes(src)) if decode else _bitplane_encode_compiler(bytes(src))
+    if op in (Op.DELTA8,Op.XOR8,Op.NIBBLE,Op.TRANSPOSE4,Op.TRANSPOSE8,Op.STRIDE2,Op.STRIDE4,Op.STRIDE8):
         kind=Kind(op.value)
+        if decode and op==Op.NIBBLE:
+            return inverse(src,kind,original_size=len(src)//2)
+        if decode and op in (Op.STRIDE2,Op.STRIDE4,Op.STRIDE8):
+            return inverse(src,kind,original_size=len(src))
         return inverse(src,kind,original_size=original_size) if decode else transform(src,kind)
     if op in (Op.DELTA16,Op.DELTA32,Op.DELTA64,Op.XOR16,Op.XOR32,Op.XOR64,Op.SWAP16,Op.SWAP32,Op.SWAP64):
         name=op.name; width=int(name[-2:])//8; action="delta" if name.startswith("DELTA") else "xor" if name.startswith("XOR") else "swap"
@@ -81,8 +108,10 @@ def _apply_one(src,op,decode=False,original_size=None):
     if op in (Op.BYTE_LANES2,Op.BYTE_LANES4,Op.BYTE_LANES8):
         width={Op.BYTE_LANES2:2,Op.BYTE_LANES4:4,Op.BYTE_LANES8:8}[op]
         if decode:
-            if original_size is None: raise IRFormatError("lane decode requires original size")
-            return _lanes_decode(src,width,original_size)
+            # BYTE_LANES is length preserving.  In a composed pipeline the
+            # relevant size is therefore the current payload size, not the
+            # final source size (which may be separated by RLE/NIBBLE/etc.).
+            return _lanes_decode(src,width,len(src))
         return _lanes_encode(src,width)
     raise IRFormatError(f"unknown IR op {op}")
 
