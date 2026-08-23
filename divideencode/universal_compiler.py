@@ -1,10 +1,7 @@
 """Universal Binary IR compiler for DE2.
 
-This module is deliberately format-agnostic: every input is first treated as
-bytes, then compiled into a self-describing reversible Binary IR pipeline.
-The IR is allowed to grow without limit; callers compare only the final DE2
-size.  A pipeline is a sequence of reversible byte transforms, so the exact
-original bytes can always be reconstructed.
+Any input is bytes, then compiled into a reversible Universal Binary IR
+program. The IR may grow without limit; only final DE2 size is authoritative.
 """
 from __future__ import annotations
 
@@ -14,7 +11,6 @@ import math
 import struct
 
 from .universal_ir import Kind, transform, inverse
-
 
 IR_MAGIC = b"UBIR"
 IR_VERSION = 2
@@ -57,9 +53,7 @@ class Pipeline:
 
     @property
     def name(self) -> str:
-        if not self.instructions:
-            return "RAW"
-        return "+".join(i.op.name for i in self.instructions)
+        return "RAW" if not self.instructions else "+".join(i.op.name for i in self.instructions)
 
 
 @dataclass(frozen=True)
@@ -81,18 +75,21 @@ def _word_transform(src: bytes, width: int, op: str, decode: bool = False) -> by
     prev = 0
     for off in range(0, full, width):
         value = int.from_bytes(src[off:off + width], "little")
+        original = value
         if op == "delta":
             if decode:
                 value = (prev + value) & mask
+                prev = value
             else:
                 value = (value - prev) & mask
-            prev = value if decode else int.from_bytes(src[off:off + width], "little")
+                prev = original
         elif op == "xor":
             if decode:
                 value ^= prev
+                prev = value
             else:
                 value ^= prev
-            prev = value if decode else int.from_bytes(src[off:off + width], "little")
+                prev = original
         elif op == "swap":
             value = int.from_bytes(value.to_bytes(width, "little")[::-1], "little")
         else:
@@ -102,8 +99,6 @@ def _word_transform(src: bytes, width: int, op: str, decode: bool = False) -> by
 
 
 def _rle_encode(src: bytes) -> bytes:
-    # Fixed 5-byte records: one byte value + uint32 run length.  A literal
-    # record is simply a run of length one.  DE2 is free to compress records.
     if not src:
         return b""
     out = bytearray()
@@ -155,13 +150,13 @@ def _lanes_decode(src: bytes, width: int, original_size: int) -> bytes:
     return bytes(out)
 
 
-def _apply_one(src: bytes, op: Op, decode: bool = False, original_size: int | None = None) -> bytes:
+def _apply_one(src: bytes, op: Op, decode: bool = False) -> bytes:
     if op == Op.RAW:
         return bytes(src)
     if op in (Op.DELTA8, Op.XOR8, Op.NIBBLE, Op.BITPLANE, Op.TRANSPOSE4,
               Op.TRANSPOSE8, Op.STRIDE2, Op.STRIDE4, Op.STRIDE8):
         kind = Kind(op.value)
-        return inverse(src, kind, original_size=original_size) if decode else transform(src, kind)
+        return inverse(src, kind) if decode else transform(src, kind)
     if op in (Op.DELTA16, Op.DELTA32, Op.DELTA64, Op.XOR16, Op.XOR32, Op.XOR64,
               Op.SWAP16, Op.SWAP32, Op.SWAP64):
         name = op.name
@@ -172,11 +167,7 @@ def _apply_one(src: bytes, op: Op, decode: bool = False, original_size: int | No
         return _rle_decode(src) if decode else _rle_encode(src)
     if op in (Op.BYTE_LANES2, Op.BYTE_LANES4, Op.BYTE_LANES8):
         width = {Op.BYTE_LANES2: 2, Op.BYTE_LANES4: 4, Op.BYTE_LANES8: 8}[op]
-        if decode:
-            if original_size is None:
-                raise IRFormatError("lane decode requires original size")
-            return _lanes_decode(src, width, original_size)
-        return _lanes_encode(src, width)
+        return _lanes_decode(src, width, len(src)) if decode else _lanes_encode(src, width)
     raise IRFormatError(f"unknown IR op {op}")
 
 
@@ -190,14 +181,13 @@ def encode_pipeline(src: bytes, pipeline: Pipeline) -> bytes:
 def decode_pipeline(payload: bytes, pipeline: Pipeline, original_size: int) -> bytes:
     data = bytes(payload)
     for instruction in reversed(pipeline.instructions):
-        data = _apply_one(data, instruction.op, decode=True, original_size=original_size)
+        data = _apply_one(data, instruction.op, decode=True)
     if len(data) != original_size:
         raise IRFormatError("decoded IR size mismatch")
     return data
 
 
 def serialize(compiled: CompiledIR) -> bytes:
-    # Header: magic, version, instruction count, original size, then op bytes.
     if len(compiled.pipeline.instructions) > 255:
         raise IRFormatError("pipeline too long")
     header = struct.pack("<4sBBQ", IR_MAGIC, IR_VERSION,
@@ -214,19 +204,15 @@ def deserialize(blob: bytes) -> CompiledIR:
     pos = 14
     if len(blob) < pos + count:
         raise IRFormatError("truncated universal IR instructions")
-    instructions = []
-    for raw in blob[pos:pos + count]:
-        try:
-            instructions.append(Instruction(Op(raw)))
-        except ValueError as exc:
-            raise IRFormatError(f"unknown IR opcode {raw}") from exc
-    payload = bytes(blob[pos + count:])
-    return CompiledIR(payload, Pipeline(tuple(instructions)), original_size)
+    try:
+        instructions = tuple(Instruction(Op(v)) for v in blob[pos:pos + count])
+    except ValueError as exc:
+        raise IRFormatError("unknown universal IR opcode") from exc
+    return CompiledIR(bytes(blob[pos + count:]), Pipeline(instructions), original_size)
 
 
 def verify_pipeline(src: bytes, pipeline: Pipeline) -> None:
-    encoded = encode_pipeline(src, pipeline)
-    restored = decode_pipeline(encoded, pipeline, len(src))
+    restored = decode_pipeline(encode_pipeline(src, pipeline), pipeline, len(src))
     if restored != bytes(src):
         raise AssertionError(f"universal IR roundtrip failed: {pipeline.name}")
 
@@ -251,61 +237,25 @@ def _repeat_ratio(data: bytes) -> float:
     return sum(a == b for a, b in zip(data, data[1:])) / (len(data) - 1)
 
 
-def _word_delta_zero(data: bytes, width: int) -> float:
-    full = len(data) - len(data) % width
-    if full < width * 2:
-        return 0.0
-    prev = int.from_bytes(data[:width], "little")
-    zeros = 0
-    total = 0
-    for off in range(width, full, width):
-        value = int.from_bytes(data[off:off + width], "little")
-        delta = (value - prev) & ((1 << (width * 8)) - 1)
-        if delta == 0:
-            zeros += 1
-        total += 1
-        prev = value
-    return zeros / total if total else 0.0
-
-
-def _column_similarity(data: bytes, width: int) -> float:
-    if len(data) < width * 16:
-        return 0.0
-    cols = [set() for _ in range(width)]
-    for i, b in enumerate(data[: min(len(data), 256 * 1024)]):
-        cols[i % width].add(b)
-    # Low average cardinality per lane is a useful signal for field/lane IR.
-    return max(0.0, 1.0 - sum(len(c) for c in cols) / (256.0 * width))
-
-
 def _candidate_pipelines(data: bytes) -> list[Pipeline]:
     sample = bytes(data[: min(len(data), 256 * 1024)])
     if not sample:
         return [Pipeline(())]
     candidates: list[Pipeline] = [Pipeline(())]
-    # Single-stage universal transforms.
     for op in Op:
         if op != Op.RAW:
             candidates.append(Pipeline((Instruction(op),)))
-    # Composition is where this becomes a compiler rather than a transform
-    # switch.  Keep combinations reversible and bounded.
     preferred = [Op.DELTA8, Op.XOR8, Op.DELTA16, Op.DELTA32, Op.XOR16,
                  Op.XOR32, Op.BYTE_LANES2, Op.BYTE_LANES4, Op.BYTE_LANES8,
                  Op.STRIDE2, Op.STRIDE4, Op.STRIDE8]
-    candidates.extend(
-        Pipeline((Instruction(a), Instruction(b)))
-        for a in preferred for b in preferred
-        if a != b
-    )
-    # Numeric files benefit from word delta followed by byte-lane separation.
+    candidates.extend(Pipeline((Instruction(a), Instruction(b)))
+                      for a in preferred for b in preferred if a != b)
     for width in (16, 32, 64):
         delta = Op[f"DELTA{width}"]
         xor = Op[f"XOR{width}"]
         for lane in (Op.BYTE_LANES2, Op.BYTE_LANES4, Op.BYTE_LANES8):
             candidates.append(Pipeline((Instruction(delta), Instruction(lane))))
             candidates.append(Pipeline((Instruction(xor), Instruction(lane))))
-    # Repeat-heavy data gets a dedicated RLE path, but it is still evaluated by
-    # DE2 and can lose to RAW.
     if _repeat_ratio(sample) >= 0.04 or _zero_ratio(sample) >= 0.08:
         candidates.append(Pipeline((Instruction(Op.RLE),)))
         candidates.append(Pipeline((Instruction(Op.RLE), Instruction(Op.BYTE_LANES4))))
@@ -313,11 +263,10 @@ def _candidate_pipelines(data: bytes) -> list[Pipeline]:
 
 
 def plan(data: bytes, *, max_candidates: int = 32) -> list[Pipeline]:
-    """Return a bounded, deterministic set of complete IR programs.
+    """Return complete IR programs for DE2 evaluation.
 
-    Ranking is intentionally a cheap representation heuristic only.  The
-    caller must compile every returned program through DE2 and select by the
-    verified final DE2 byte count.
+    The heuristic only limits search. It never declares a compression winner;
+    the caller must measure final DE2 output for every selected program.
     """
     src = bytes(data)
     candidates = _candidate_pipelines(src)
@@ -328,7 +277,6 @@ def plan(data: bytes, *, max_candidates: int = 32) -> list[Pipeline]:
             transformed = encode_pipeline(sample, pipeline)
         except (ValueError, IRFormatError):
             continue
-        # Proxy is only used to bound search, never to declare a winner.
         score = _entropy(transformed) + 0.5 * (1.0 - _zero_ratio(transformed))
         score += 0.15 * len(transformed) / max(1, len(sample))
         scored.append((score, pipeline))
