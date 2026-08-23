@@ -3,6 +3,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from divideencode import de2
 from divideencode.v3 import universal_binary_ir as ubir
 
 
@@ -13,11 +14,15 @@ def test_json_roundtrip_preserves_bytes():
     assert ubir.candidates(data, ".json")
 
 
-def test_json_dictionary_and_delta_are_used():
+def test_json_transform_is_selected_by_final_de2_size():
     data = b'{"a":"repeat","b":"repeat","c":"repeat","n":100,"m":105,"k":110}'
+    direct = de2.compress(data, block_size=1 << 20, level="BALANCED")
     blob = ubir.encode(data, "json")
-    assert len(blob) < len(data)
+    packed = de2.compress(blob, block_size=1 << 20, level="BALANCED")
     assert ubir.decode(blob) == data
+    # The IR itself is allowed to be larger than the source; only the final
+    # packed representation is the optimization criterion.
+    assert len(packed) <= len(direct)
 
 
 def test_csv_roundtrip():
