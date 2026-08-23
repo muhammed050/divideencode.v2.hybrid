@@ -1,6 +1,5 @@
 """Benchmark Structural Engine v4 against raw DE2."""
 from __future__ import annotations
-
 import sys
 from pathlib import Path
 
@@ -25,11 +24,20 @@ def main() -> None:
 
     wins = 0
     regressions = 0
+    rejected = 0
     for name, data in workloads:
         baseline = len(de2_compress(data))
 
         def score(blob: bytes) -> int:
-            return len(de2_compress(blob))
+            nonlocal rejected
+            try:
+                return len(de2_compress(blob))
+            except (OverflowError, ValueError):
+                # A structural candidate is not useful if the downstream
+                # codec cannot represent it. Treat it as an invalid/high-cost
+                # candidate instead of allowing the benchmark to abort.
+                rejected += 1
+                return 1 << 60
 
         decision = adaptive_transform(data, scorer=score, max_depth=3)
         final_blob = de2_compress(decision.blob)
@@ -50,6 +58,7 @@ def main() -> None:
     print("-" * 118)
     print(f"wins over raw DE2 : {wins}/{len(workloads)}")
     print(f"regressions       : {regressions}")
+    print(f"rejected candidates: {rejected}")
     assert regressions == 0, "Structural Engine v4 regressed against raw DE2"
     print("PASS: v4 adaptive layer never forces a worse representation on this suite.")
 
