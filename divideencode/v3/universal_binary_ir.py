@@ -1,24 +1,14 @@
 """Universal Binary IR (UBIR) experiment for V3.
 
-The IR is a reversible, self-describing intermediate representation for
-structured JSON and canonical CSV. It is intentionally separate from DE2:
-DE2 remains the entropy backend and the caller should select UBIR only when
-final DE2 output is smaller than the direct path.
-
-Design goals:
-- byte-exact round trips;
-- repeated strings/keys become dictionary references;
-- integer columns/number streams use zigzag delta-varints;
-- JSON structure is represented as typed events, so formatting is preserved;
-- CSV is transposed into typed columns when the input is canonical CSV;
-- no external dictionary or schema is required.
+A reversible, self-describing intermediate representation for structured
+JSON and canonical CSV. DE2 remains the entropy backend; callers select UBIR
+only when the final DE2 stream is smaller than direct DE2.
 """
 from __future__ import annotations
 
 import csv
 import io
 import re
-import struct
 from collections import Counter
 
 MAGIC = b"UBIR"
@@ -26,8 +16,6 @@ VERSION = 1
 K_JSON = 1
 K_CSV = 2
 
-# JSON lexical token tags.
-J_WS = 0
 J_PUNCT = 1
 J_STRING = 2
 J_INT = 3
@@ -35,9 +23,8 @@ J_RAW = 4
 J_DICT = 5
 
 _JSON_TOKEN = re.compile(
-    rb"(?:[ \t\r\n]+|[{}\[\],:]|\"(?:\\.|[^\"\\])*\"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null)"
+    rb'(?:[ \t\r\n]+|[{}\[\],:]|"(?:\\.|[^"\\])*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null)'
 )
-_JSON_STRING = re.compile(r'^"(?:\\.|[^"\\])*"$')
 _JSON_INT = re.compile(r"^-?(?:0|[1-9][0-9]*)$")
 
 
@@ -62,7 +49,7 @@ def _r(data: bytes, p: int) -> tuple[int, int]:
         if not b & 0x80:
             return n, p
         shift += 7
-        if shift > 63:
+        if shift > 4096:
             raise ValueError("varint too long")
     raise ValueError("truncated varint")
 
@@ -80,11 +67,13 @@ def _g(data: bytes, p: int) -> tuple[bytes, int]:
 
 
 def _zz(n: int) -> int:
-    return (n << 1) ^ (n >> 63)
+    # Generic zigzag mapping; unlike the common 64-bit formula this is safe
+    # for JSON integers of arbitrary Python precision.
+    return (n << 1) if n >= 0 else ((-n << 1) - 1)
 
 
 def _uzz(n: int) -> int:
-    return (n >> 1) ^ -(n & 1)
+    return (n >> 1) if not (n & 1) else -((n >> 1) + 1)
 
 
 def _json_tokens(data: bytes) -> list[bytes]:
@@ -102,18 +91,18 @@ def _json_tokens(data: bytes) -> list[bytes]:
 
 def _json_encode(data: bytes) -> bytes:
     tokens = _json_tokens(data)
-    strings = Counter()
-    for t in tokens:
-        if t[:1] == b'"':
-            strings[t] += 1
-    dictionary = sorted((x for x, n in strings.items() if n >= 2), key=lambda x: (-strings[x] * len(x), x))
+    strings = Counter(t for t in tokens if t[:1] == b'"')
+    dictionary = sorted(
+        (x for x, n in strings.items() if n >= 2),
+        key=lambda x: (-strings[x] * len(x), x),
+    )
     ids = {x: i for i, x in enumerate(dictionary)}
 
-    out = bytearray()
-    out += _u(len(dictionary))
+    out = bytearray(_u(len(dictionary)))
     for s in dictionary:
         out += _s(s)
     out += _u(len(tokens))
+
     prev_int = 0
     for t in tokens:
         if t[:1] in b"{}[],:":
@@ -121,12 +110,12 @@ def _json_encode(data: bytes) -> bytes:
             out += _s(t)
         elif t[:1] == b'"':
             i = ids.get(t)
-            if i is not None:
-                out.append(J_DICT)
-                out += _u(i)
-            else:
+            if i is None:
                 out.append(J_STRING)
                 out += _s(t)
+            else:
+                out.append(J_DICT)
+                out += _u(i)
         elif _JSON_INT.fullmatch(t.decode("ascii")):
             out.append(J_INT)
             value = int(t)
@@ -179,15 +168,12 @@ def _csv_parse_exact(data: bytes):
         return None
     if not text or "," not in text:
         return None
-    stream = io.StringIO(text, newline="")
-    rows = list(csv.reader(stream))
+    rows = list(csv.reader(io.StringIO(text, newline="")))
     if not rows or any(len(r) != len(rows[0]) for r in rows):
         return None
-    # The IR decoder uses the canonical CSV writer. Only accept inputs for
-    # which that reconstruction is byte-exact; no silent formatting changes.
+    # Gate the transform on byte-exact canonical reconstruction.
     buf = io.StringIO(newline="")
-    w = csv.writer(buf, lineterminator="\n")
-    w.writerows(rows)
+    csv.writer(buf, lineterminator="\n").writerows(rows)
     if buf.getvalue().encode("utf-8") != data:
         return None
     return rows
@@ -218,7 +204,10 @@ def _csv_encode(data: bytes) -> bytes:
         else:
             out.append(2)
             counts = Counter(vals)
-            dictionary = sorted((v for v, c in counts.items() if c >= 2), key=lambda v: (-counts[v] * len(v), v))
+            dictionary = sorted(
+                (v for v, c in counts.items() if c >= 2),
+                key=lambda v: (-counts[v] * len(v), v),
+            )
             ids = {v: i for i, v in enumerate(dictionary)}
             out += _u(len(dictionary))
             for v in dictionary:
@@ -290,11 +279,9 @@ def _csv_decode(payload: bytes) -> bytes:
 
 def encode(data: bytes, kind: str) -> bytes:
     if kind == "json":
-        payload = _json_encode(data)
-        code = K_JSON
+        payload, code = _json_encode(data), K_JSON
     elif kind == "csv":
-        payload = _csv_encode(data)
-        code = K_CSV
+        payload, code = _csv_encode(data), K_CSV
     else:
         raise ValueError("UBIR supports json/csv candidates only")
     return MAGIC + bytes([VERSION, code]) + _u(len(data)) + payload
