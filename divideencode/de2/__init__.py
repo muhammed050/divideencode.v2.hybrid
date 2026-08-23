@@ -5,7 +5,7 @@ Pipeline per block:
     separated token streams (Huffman literals) -> DE2 block container
 
 Public API:
-    compress(data, block_size=262144)  -> DE2 container bytes
+    compress(data, block_size=1 MiB) -> DE2 container bytes
     decompress(blob, verify=True)      -> original bytes
 
 Containers written by this module set FLAG_LZ_V2: MODE_LZ / MODE_DELTA_LZ
@@ -25,7 +25,7 @@ from .container import (MAGIC, VERSION, FLAG_LZ_V2, parse_header,
                         check_block_crc)
 from .features import scan_features
 
-DEFAULT_BLOCK_SIZE = 262144   # 256 KiB
+DEFAULT_BLOCK_SIZE = 1048576   # 1 MiB — isolated benchmark branch
 
 
 def _encode_block(data, max_chain=lz.MAX_CHAIN, lazy=lz.LAZY, level=None):
@@ -67,8 +67,7 @@ def compress(data, block_size=DEFAULT_BLOCK_SIZE, max_chain=lz.MAX_CHAIN,
              lazy=lz.LAZY, level="BALANCED"):
     """Compress bytes into a DE2 container.
 
-    block_size: independent block granularity (64 KiB..1 MiB sensible;
-        larger blocks trade ~1-2% better ratio for decode locality).
+    block_size defaults to 1 MiB on this isolated benchmark branch.
     level: "FAST" | "BALANCED" | "MAX" matcher preset (v3). Explicit
         max_chain/lazy kwargs override the preset for legacy callers.
     """
