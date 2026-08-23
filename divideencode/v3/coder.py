@@ -1,5 +1,6 @@
 """DE3-derived merged token coder used by the V3 representation experiment."""
 from heapq import heapify, heappop, heappush
+import zlib
 
 from ..errors import DivideEncodeError
 
@@ -165,7 +166,7 @@ def encode_tokens(tokens):
     tokens = list(tokens)
     freq = _freq(tokens)
     if not tokens:
-        return MAGIC + bytes([VERSION]) + _varint(0) + _varint(0) + _varint(0) + b"\x00"
+        return MAGIC + bytes([VERSION]) + _varint(0) + _varint(0) + _varint(0) + b"\x00" + b"\x00\x00\x00\x00"
 
     codes, _ = _codes(freq)
     bits = _Bits()
@@ -180,6 +181,7 @@ def encode_tokens(tokens):
         _eg_put(bits, token[2] - 1 if kind == MATCH else token[2])
 
     payload, pad = bits.finish()
+    crc = zlib.crc32(payload) & 0xffffffff
     header = bytearray(MAGIC)
     header.append(VERSION)
     header += _varint(len(tokens))
@@ -189,6 +191,7 @@ def encode_tokens(tokens):
         header.append(length)
     header += _varint(len(payload))
     header.append(pad)
+    header += crc.to_bytes(4, "little")
     return bytes(header) + payload
 
 
@@ -206,11 +209,11 @@ def decode_tokens(blob):
         if nsym != 0:
             raise DivideEncodeError("invalid empty DE3 alphabet")
         payload_len, p = _read_varint(data, p)
-        if p >= len(data):
-            raise DivideEncodeError("truncated DE3 header")
+        if p + 5 != len(data):
+            raise DivideEncodeError("invalid empty DE3 payload")
         pad = data[p]
         p += 1
-        if payload_len != 0 or pad != 0 or p != len(data):
+        if payload_len != 0 or pad != 0 or bytes(data[p:p + 4]) != b"\x00\x00\x00\x00":
             raise DivideEncodeError("invalid empty DE3 payload")
         return []
 
@@ -229,12 +232,17 @@ def decode_tokens(blob):
         lengths[sym] = length
 
     payload_len, p = _read_varint(data, p)
-    if p >= len(data):
+    if p + 5 > len(data):
         raise DivideEncodeError("truncated DE3 header")
     pad = data[p]
     p += 1
+    stored_crc = int.from_bytes(bytes(data[p:p + 4]), "little")
+    p += 4
     if pad > 7 or payload_len != len(data) - p or payload_len == 0:
         raise DivideEncodeError("invalid DE3 payload")
+    payload = bytes(data[p:p + payload_len])
+    if (zlib.crc32(payload) & 0xffffffff) != stored_crc:
+        raise DivideEncodeError("DE3 payload checksum mismatch")
 
     ordered = sorted(lengths.items(), key=lambda x: (x[1], x[0]))
     dec = {}
@@ -250,7 +258,6 @@ def decode_tokens(blob):
     if code > (1 << prev):
         raise DivideEncodeError("oversubscribed DE3 Huffman table")
 
-    # Header is byte-aligned. Decode only the declared payload, not the header.
     bitpos = p * 8
     end = (p + payload_len) * 8 - pad
     out = []
