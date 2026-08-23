@@ -35,13 +35,15 @@ def _encode_block(data, max_chain=lz.MAX_CHAIN, lazy=lz.LAZY, level=None):
     payload = None
     tmeta = b""
 
-    # Structured text now has a real reversible IR.  We keep the candidate
-    # adaptive: the phrase representation is only accepted when the final
-    # DE2 block (metadata + LZ frame + container fields) beats direct LZ.
-    if mode == MODE_STRUCT_LZ or (
+    # Phrase IR is an optional front-end for ordinary/structured byte LZ.
+    # Numeric DELTA+LZ keeps priority because it has a different reversible
+    # model and may be substantially better on counter/sensor data.
+    phrase_eligible = mode in (MODE_LZ, MODE_STRUCT_LZ) and (
+        mode == MODE_STRUCT_LZ or (
             len(data) >= 4096 and
             fs.printable_frac >= 0.82 and
-            fs.match_density >= 0.03):
+            fs.match_density >= 0.03))
+    if phrase_eligible:
         transformed, pmeta = phrase.encode(data, phrase_len=6, max_dict=255)
         if transformed is not None:
             frame = lz.encode_v2(transformed, max_chain=max_chain,
@@ -54,7 +56,7 @@ def _encode_block(data, max_chain=lz.MAX_CHAIN, lazy=lz.LAZY, level=None):
                 return phrase_block
 
         # If phrase IR loses, continue with the normal mode selected by the
-        # classifier.  STRUCT+LZ therefore degrades safely to plain LZ.
+        # classifier. STRUCT+LZ safely degrades to ordinary LZ.
         if mode == MODE_STRUCT_LZ:
             mode = MODE_LZ
 
