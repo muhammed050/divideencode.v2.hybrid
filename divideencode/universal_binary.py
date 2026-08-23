@@ -26,6 +26,20 @@ class SearchMode(IntEnum):
     MAX = 3
 
 
+# Extra binary representations live here so the older UBIR1 Kind enum stays
+# wire-compatible. Values 10..18 are reserved by UBIR2 for this family.
+class BinaryKind(IntEnum):
+    DELTA16 = 10
+    DELTA32 = 11
+    DELTA64 = 12
+    XOR16 = 13
+    XOR32 = 14
+    XOR64 = 15
+    SWAP16 = 16
+    SWAP32 = 17
+    SWAP64 = 18
+
+
 @dataclass(frozen=True)
 class Analysis:
     sample_size: int
@@ -40,7 +54,7 @@ class Analysis:
 @dataclass(frozen=True)
 class Result:
     data: bytes
-    kind: Kind
+    kind: IntEnum
     de2_size: int
     ir_size: int
     candidates_tested: int
@@ -139,33 +153,73 @@ def _textlike(data: bytes) -> float:
     return sum(1 for b in data if b in (9, 10, 13) or 32 <= b <= 126) / len(data)
 
 
-def _candidate_pool(data: bytes, mode: SearchMode) -> list[Kind]:
-    """Build a search plan, never a compression verdict.
+def _word_transform(src: bytes, width: int, op: str, decode: bool = False) -> bytes:
+    """Reversible little-endian word transform; incomplete tail is unchanged."""
+    src = bytes(src)
+    out = bytearray(src)
+    mask = (1 << (8 * width)) - 1
+    full = len(src) - (len(src) % width)
+    prev = 0
+    for off in range(0, full, width):
+        value = int.from_bytes(src[off:off + width], "little")
+        if op == "swap":
+            result = value.to_bytes(width, "little")[::-1]
+        elif op == "delta":
+            if decode:
+                value = (prev + value) & mask
+                result = value.to_bytes(width, "little")
+            else:
+                result_value = (value - prev) & mask
+                result = result_value.to_bytes(width, "little")
+            prev = value
+        elif op == "xor":
+            if decode:
+                value ^= prev
+                result = value.to_bytes(width, "little")
+            else:
+                result = (value ^ prev).to_bytes(width, "little")
+            prev = value
+        else:
+            raise ValueError(op)
+        out[off:off + width] = result
+    return bytes(out)
 
-    The old proxy rejected transforms before DE2 measured them. That defeats
-    the purpose of a representation compiler: two streams with similar byte
-    statistics can select completely different DE2 modes. In particular it
-    could reject XOR8 even when XOR8 produced a much smaller DE2 stream.
 
-    Structural statistics are now used only to ORDER candidates. The actual
-    DE2 size is the only quality signal used by the search.
-    """
+def _binary_transform(src: bytes, kind: BinaryKind, decode: bool = False) -> bytes:
+    name = kind.name
+    if name.startswith("DELTA"):
+        return _word_transform(src, int(name[5:]) // 8, "delta", decode)
+    if name.startswith("XOR"):
+        return _word_transform(src, int(name[3:]) // 8, "xor", decode)
+    if name.startswith("SWAP"):
+        return _word_transform(src, int(name[4:]) // 8, "swap", False)
+    raise ValueError(f"unknown UBIR2 binary transform: {kind}")
+
+
+def _candidate_pool(data: bytes, mode: SearchMode) -> list[IntEnum]:
+    """Rank representations; never reject one using a compression proxy."""
     sample = bytes(data[:256 * 1024])
     if not sample:
         return []
 
-    all_kinds = [
+    old_kinds: list[IntEnum] = [
         Kind.DELTA8, Kind.XOR8, Kind.NIBBLE, Kind.BITPLANE,
         Kind.TRANSPOSE4, Kind.TRANSPOSE8,
         Kind.STRIDE2, Kind.STRIDE4, Kind.STRIDE8,
     ]
+    word_kinds: list[IntEnum] = [
+        BinaryKind.DELTA16, BinaryKind.DELTA32, BinaryKind.DELTA64,
+        BinaryKind.XOR16, BinaryKind.XOR32, BinaryKind.XOR64,
+        BinaryKind.SWAP16, BinaryKind.SWAP32, BinaryKind.SWAP64,
+    ]
+    all_kinds = old_kinds + word_kinds
     text = _textlike(sample) >= 0.70
     entropy = _entropy(sample)
     zero_delta = _zero_ratio(_delta_sample(sample))
     zero_xor = _zero_ratio(_xor_sample(sample))
     column = max(_column_similarity(sample, 2), _column_similarity(sample, 4), _column_similarity(sample, 8))
 
-    priority: dict[Kind, float] = {k: 100.0 for k in all_kinds}
+    priority: dict[IntEnum, float] = {k: 100.0 for k in all_kinds}
     priority[Kind.DELTA8] -= zero_delta * 40.0
     priority[Kind.XOR8] -= zero_xor * 40.0
     priority[Kind.NIBBLE] -= max(
@@ -180,70 +234,81 @@ def _candidate_pool(data: bytes, mode: SearchMode) -> list[Kind]:
     if entropy > 7.5:
         priority[Kind.BITPLANE] += 5.0
 
+    # Word transforms are deliberately always eligible for binary-ish data.
+    # Their sample DE2 result decides whether they are useful.
+    if not text:
+        for k in word_kinds:
+            priority[k] -= 4.0
+    if column > 0.55:
+        for k in word_kinds:
+            priority[k] -= 8.0
+    if zero_delta > 0.10:
+        for k in (BinaryKind.DELTA16, BinaryKind.DELTA32, BinaryKind.DELTA64):
+            priority[k] -= 10.0
+    if zero_xor > 0.10:
+        for k in (BinaryKind.XOR16, BinaryKind.XOR32, BinaryKind.XOR64):
+            priority[k] -= 10.0
+
     ordered = sorted(all_kinds, key=lambda k: (priority[k], int(k)))
-    limits = {SearchMode.FAST: 3, SearchMode.BALANCED: 6, SearchMode.MAX: len(all_kinds)}
+    limits = {SearchMode.FAST: 5, SearchMode.BALANCED: 10, SearchMode.MAX: len(all_kinds)}
     return ordered[:limits[mode]]
 
 
-def _guided_candidates(
-    data: bytes,
-    mode: SearchMode,
-    *,
-    direct_size: int | None = None,
-    sample_size: int = 64 * 1024,
-) -> list[Kind]:
-    from .de2 import compress as de2_compress
+def _apply_transform(data: bytes, kind: IntEnum, *, decode: bool = False, original_size: int | None = None) -> bytes:
+    if isinstance(kind, BinaryKind):
+        return _binary_transform(data, kind, decode=decode)
+    return inverse(data, kind, original_size=original_size) if decode else transform(data, kind)
 
+
+def _guided_candidates(data: bytes, mode: SearchMode, *, direct_size: int | None = None, sample_size: int = 64 * 1024) -> list[IntEnum]:
+    from .de2 import compress as de2_compress
     src = bytes(data)
     if not src:
         return []
     if mode != SearchMode.MAX and direct_size is not None and direct_size / len(src) <= _DIRECT_SEARCH_CUTOFF:
         return []
-
     pool = _candidate_pool(src, mode)
-    if not pool:
-        return []
-
     sample = src[:sample_size]
-    measured: list[tuple[int, Kind]] = []
+    measured: list[tuple[int, IntEnum]] = []
     for kind in pool:
-        transformed = transform(sample, kind)
+        transformed = _apply_transform(sample, kind)
         size = len(de2_compress(transformed, level="BALANCED"))
         measured.append((size, kind))
-
     measured.sort(key=lambda x: (x[0], int(x[1])))
     if mode == SearchMode.FAST:
         return [measured[0][1]]
     if mode == SearchMode.BALANCED:
         best = measured[0][0]
-        return [kind for size, kind in measured if size <= best * 1.05][:3]
+        return [kind for size, kind in measured if size <= best * 1.08][:5]
     return [kind for _size, kind in measured]
 
 
-def rank_candidates(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, direct_size: int | None = None) -> list[Kind]:
+def rank_candidates(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, direct_size: int | None = None) -> list[IntEnum]:
     mode = _normalize_mode(mode)
     return [Kind.DIRECT] + _guided_candidates(bytes(data), mode, direct_size=direct_size)
 
 
-def _pack(kind: Kind, original_size: int, crc: int, payload: bytes) -> bytes:
+def _pack(kind: IntEnum, original_size: int, crc: int, payload: bytes) -> bytes:
     return _HEADER.pack(MAGIC, VERSION, int(kind), 0, original_size, len(payload), crc, zlib.crc32(payload) & 0xFFFFFFFF) + payload
 
 
-def _unpack(blob: bytes) -> tuple[Kind, int, int, bytes]:
+def _unpack(blob: bytes) -> tuple[IntEnum, int, int, bytes]:
     if len(blob) < _HEADER.size:
         raise NotDivideEncodedError("truncated UBIR2 container")
-    magic, version, kind, _flags, original_size, payload_size, crc, payload_crc = _HEADER.unpack_from(blob)
+    magic, version, kind_value, _flags, original_size, payload_size, crc, payload_crc = _HEADER.unpack_from(blob)
     if magic != MAGIC or version != VERSION:
         raise NotDivideEncodedError("not a UBIR2 container")
-    if kind not in {int(k) for k in Kind}:
-        raise CorruptedError("unknown UBIR2 transform")
+    try:
+        kind: IntEnum = BinaryKind(kind_value) if kind_value >= 10 else Kind(kind_value)
+    except ValueError as exc:
+        raise CorruptedError("unknown UBIR2 transform") from exc
     end = _HEADER.size + payload_size
     if end != len(blob):
         raise CorruptedError("UBIR2 payload size mismatch")
     payload = bytes(blob[_HEADER.size:end])
     if zlib.crc32(payload) & 0xFFFFFFFF != payload_crc:
         raise CorruptedError("UBIR2 payload checksum mismatch")
-    return Kind(kind), original_size, crc, payload
+    return kind, original_size, crc, payload
 
 
 def compress(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, level: str = "BALANCED", block_size: int = 1 << 20) -> bytes:
@@ -252,9 +317,9 @@ def compress(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, level
     direct_blob = de2_compress(src, block_size=block_size, level=level)
     kinds = rank_candidates(src, mode=mode, direct_size=len(direct_blob))
     best_blob = direct_blob
-    best_kind = Kind.DIRECT
+    best_kind: IntEnum = Kind.DIRECT
     for kind in kinds[1:]:
-        ir = transform(src, kind)
+        ir = _apply_transform(src, kind)
         candidate = de2_compress(ir, block_size=block_size, level=level)
         if len(candidate) < len(best_blob):
             best_blob, best_kind = candidate, kind
@@ -267,11 +332,11 @@ def compress_with_stats(data: bytes, *, mode: SearchMode | str = SearchMode.BALA
     direct_blob = de2_compress(src, block_size=block_size, level=level)
     kinds = rank_candidates(src, mode=mode, direct_size=len(direct_blob))
     best_blob = direct_blob
-    best_kind = Kind.DIRECT
+    best_kind: IntEnum = Kind.DIRECT
     best_ir_size = len(src)
     tested = 1
     for kind in kinds[1:]:
-        ir = transform(src, kind)
+        ir = _apply_transform(src, kind)
         candidate = de2_compress(ir, block_size=block_size, level=level)
         tested += 1
         if len(candidate) < len(best_blob):
@@ -283,7 +348,7 @@ def decompress(blob: bytes, *, verify: bool = True) -> bytes:
     from .de2 import decompress as de2_decompress
     kind, original_size, crc, payload = _unpack(bytes(blob))
     ir = de2_decompress(payload, verify=verify)
-    data = inverse(ir, kind, original_size=original_size)
+    data = _apply_transform(ir, kind, decode=True, original_size=original_size)
     if len(data) != original_size:
         raise CorruptedError("UBIR2 original size mismatch")
     if verify and zlib.crc32(data) & 0xFFFFFFFF != crc:
