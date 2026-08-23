@@ -59,14 +59,73 @@ def _live_line(msg):
     sys.stdout.flush()
 
 
+def _solve_window(data, start, lookahead, window_size, max_chain, max_match,
+                  reps0, reps1, stats):
+    """Iterative DP for one bounded window; avoids Python recursion depth."""
+    end = min(len(data), start + lookahead)
+    INF = 10**18
+    costs = {}
+    choices = {}
+
+    # The state is (position, rep0, rep1). Build it backwards so there is no
+    # recursive call chain and no dependency on Python's recursion limit.
+    for i in range(end, start - 1, -1):
+        if i == end:
+            costs[(i, reps0, reps1)] = 0
+            continue
+
+        states = set()
+        # At each position, the reachable REP states are derived from the
+        # current state. For the bounded experiment we keep the supplied REP
+        # state and any explicit distance encountered at this position.
+        states.add((reps0, reps1))
+        if i > start:
+            for (p, r0, r1) in list(costs):
+                if p == i:
+                    states.add((r0, r1))
+
+        for r0, r1 in states:
+            key = (i, r0, r1)
+            next_key = (i + 1, r0, r1)
+            best = 8 + costs.get(next_key, INF)
+            choice = (LIT, data[i])
+            reps = tuple(x for x in (r0, r1) if x)
+            candidates = _candidates(data, i, window_size, max_match, max_chain, reps)
+            stats["candidates"] += len(candidates)
+            stats["last_candidates"] = len(candidates)
+
+            for length, dist, ri in candidates:
+                stop = min(length, end - i)
+                for l in range(MIN_MATCH, stop + 1):
+                    ni = i + l
+                    if ri >= 0:
+                        nr0, nr1 = (r1, r0) if ri == 1 else (r0, r1)
+                        tail = costs.get((ni, nr0, nr1), INF)
+                        cost = _token_cost(l, dist, ri) + tail
+                        if cost < best:
+                            best = cost
+                            choice = (REP, l, ri)
+                    else:
+                        nr0, nr1 = dist, r0
+                        tail = costs.get((ni, nr0, nr1), INF)
+                        cost = _token_cost(l, dist, -1) + tail
+                        if cost < best:
+                            best = cost
+                            choice = (MATCH, l, dist)
+            costs[key] = best
+            choices[key] = choice
+
+    # Reconstruct only the first decision. The outer loop will start a fresh
+    # bounded window, keeping memory bounded by the lookahead.
+    key = (start, reps0, reps1)
+    stats["last_cost"] = costs.get(key, 0)
+    return choices.get(key, (LIT, data[start]))
+
+
 def tokenize_bounded(data, lookahead=64, window_size=DEFAULT_WINDOW,
                      max_chain=32, max_match=DEFAULT_MAX_MATCH,
                      progress=False, progress_every=4096):
-    """Bounded minimum-cost parser.
-
-    ``progress=True`` displays current position, candidate count, selected
-    token, token count, and elapsed time. Production code is unaffected.
-    """
+    """Bounded minimum-cost parser with optional live terminal diagnostics."""
     if not isinstance(data, bytes):
         data = bytes(data)
     if lookahead < 1:
@@ -77,63 +136,22 @@ def tokenize_bounded(data, lookahead=64, window_size=DEFAULT_WINDOW,
             print("[DE2-OPT] empty input")
         return []
 
-    from functools import lru_cache
     started = time.perf_counter()
-    total_candidates = 0
+    stats = {"candidates": 0, "last_candidates": 0, "last_cost": 0}
     selected = {LIT: 0, MATCH: 0, REP: 0}
-    last_candidates = 0
-    last_cost = 0
-
-    def solve(start, reps0, reps1):
-        nonlocal total_candidates, last_candidates, last_cost
-        end = min(n, start + lookahead)
-
-        @lru_cache(maxsize=None)
-        def dp(i, r0, r1):
-            nonlocal total_candidates, last_candidates, last_cost
-            lit_tail = dp(i + 1, r0, r1)
-            best_cost = 8 + lit_tail[0]
-            best = ((LIT, data[i]),) + lit_tail[1]
-            reps = tuple(x for x in (r0, r1) if x)
-            candidates = _candidates(data, i, window_size, max_match, max_chain, reps)
-            total_candidates += len(candidates)
-            last_candidates = len(candidates)
-            for length, dist, ri in candidates:
-                stop = min(length, end - i)
-                for l in range(MIN_MATCH, stop + 1):
-                    ni = i + l
-                    if ri >= 0:
-                        if ri == 1:
-                            nr0, nr1 = r1, r0
-                        else:
-                            nr0, nr1 = r0, r1
-                        tail = dp(ni, nr0, nr1)
-                        cost = _token_cost(l, dist, ri) + tail[0]
-                        if cost < best_cost:
-                            best_cost = cost
-                            best = ((REP, l, ri),) + tail[1]
-                    else:
-                        nr0, nr1 = dist, r0
-                        tail = dp(ni, nr0, nr1)
-                        cost = _token_cost(l, dist, -1) + tail[0]
-                        if cost < best_cost:
-                            best_cost = cost
-                            best = ((MATCH, l, dist),) + tail[1]
-            last_cost = best_cost
-            return best_cost, best
-
-        return dp(start, reps0, reps1)[1]
-
     tokens = []
     i = 0
     reps = []
     last_report = -progress_every
+
     if progress:
         print(f"[DE2-OPT] start bytes={n:,} lookahead={lookahead} chain={max_chain}")
 
     while i < n:
-        block = solve(i, reps[0] if reps else 0, reps[1] if len(reps) > 1 else 0)
-        tok = block[0] if block else (LIT, data[i])
+        r0 = reps[0] if reps else 0
+        r1 = reps[1] if len(reps) > 1 else 0
+        tok = _solve_window(data, i, lookahead, window_size, max_chain,
+                            max_match, r0, r1, stats)
         tokens.append(tok)
         selected[tok[0]] = selected.get(tok[0], 0) + 1
 
@@ -158,9 +176,9 @@ def tokenize_bounded(data, lookahead=64, window_size=DEFAULT_WINDOW,
             detail = f"len={tok[1]} dist={tok[2]}" if tok[0] != LIT else f"byte=0x{tok[1]:02x}"
             _live_line(
                 f"[DE2-OPT] {pct:6.2f}% pos={i:,}/{n:,} "
-                f"candidates={last_candidates} total_candidates={total_candidates:,} "
+                f"candidates={stats['last_candidates']} total_candidates={stats['candidates']:,} "
                 f"selected={name}({detail}) tokens={len(tokens):,} "
-                f"cost={last_cost} elapsed={elapsed:.2f}s"
+                f"cost={stats['last_cost']} elapsed={elapsed:.2f}s"
             )
             last_report = i
 
@@ -170,7 +188,7 @@ def tokenize_bounded(data, lookahead=64, window_size=DEFAULT_WINDOW,
         print(
             f"[DE2-OPT] done tokens={len(tokens):,} "
             f"LIT={selected.get(LIT, 0):,} MATCH={selected.get(MATCH, 0):,} "
-            f"REP={selected.get(REP, 0):,} candidates={total_candidates:,} "
+            f"REP={selected.get(REP, 0):,} candidates={stats['candidates']:,} "
             f"elapsed={elapsed:.3f}s"
         )
     return tokens
