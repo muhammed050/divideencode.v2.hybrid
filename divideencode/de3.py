@@ -1,12 +1,17 @@
 """DE3 representation search.
 
-Goal: minimize final encoded size, not encode speed. DE3 treats DivideEncode
-as a representation-search problem: generate reversible transforms, compose
-useful transforms, and eventually let a final entropy/LZ coder encode the
-winning representation. Every candidate carries metadata cost.
+DE3 is deliberately different from the old hybrid parser: the objective is
+*final serialized size*.  A transform is useful only when it makes the final
+coder produce fewer bytes after all representation metadata is paid.
+
+The current search uses zlib level 9 as a deterministic stand-in for the
+future native DE3 entropy/LZ backend.  This is a ranking oracle, not the
+production bitstream coder.  Keeping the oracle separate lets us evolve the
+representation search without confusing transform size with compression.
 """
 from __future__ import annotations
 
+import zlib
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -23,7 +28,18 @@ class Representation:
     parent: Optional["Representation"] = None
 
     @property
+    def coder_size(self) -> int:
+        """Exact size of the current research ranking oracle."""
+        return len(zlib.compress(self.data, level=9))
+
+    @property
     def total_size(self) -> int:
+        """Final size = transform metadata + bytes emitted by final coder."""
+        return len(self.metadata) + self.coder_size
+
+    @property
+    def transform_size(self) -> int:
+        """Raw transformed size, useful for diagnostics only."""
         return len(self.data) + len(self.metadata)
 
 
@@ -56,32 +72,41 @@ def _divide_candidate(data: bytes, w: int, d: int) -> Optional[Representation]:
 
 
 def generate_divide_candidates(data: bytes, limit: int = 12) -> list[Representation]:
+    """Generate reversible Divide views without filtering on raw size.
+
+    A transform that grows as bytes can still win after the final coder sees
+    its structure, so the old ``len(transformed) < len(input)`` gate is
+    intentionally gone.
+    """
     out: list[Representation] = []
     for w in WORD_SIZES:
         if len(data) < 4 * w:
             continue
         for d in DIVISORS:
             cand = _divide_candidate(data, w, d)
-            if cand is not None and cand.total_size < len(data) + HEADER_SIZE:
+            if cand is not None:
                 out.append(cand)
     out.sort(key=lambda x: x.total_size)
     return out[:limit]
 
 
 def search_representations(data: bytes, *, beam: int = 16, max_depth: int = 2) -> Representation:
-    """Beam-search reversible representations using exact byte accounting."""
+    """Beam-search representations using final serialized size as objective."""
     root = identity(data)
     beam_items = [root]
     best = root
-    seen = {root.data}
+    # Include representation bytes AND transform history in the key. Two
+    # identical payloads can have different decoding metadata.
+    seen = {(root.data, root.metadata)}
 
     for _depth in range(max_depth):
         expanded: list[Representation] = []
         for parent in beam_items:
             for cand in generate_divide_candidates(parent.data, limit=beam):
-                if cand.data in seen:
+                key = (cand.data, parent.metadata + cand.metadata)
+                if key in seen:
                     continue
-                seen.add(cand.data)
+                seen.add(key)
                 expanded.append(
                     Representation(
                         name=f"{parent.name} -> {cand.name}",
