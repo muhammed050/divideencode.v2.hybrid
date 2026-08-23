@@ -5,44 +5,40 @@ from collections import deque
 from .lz import LIT,MATCH,REP,MIN_MATCH,DEFAULT_MAX_MATCH,DEFAULT_WINDOW
 
 def _match_length(data,a,b,limit):
-    if a<0 or b<0 or a>=b: return 0
-    end=min(limit,len(data)-a,len(data)-b); l=0
-    while l<end and data[a+l]==data[b+l]: l+=1
+    if a<0 or b<0 or a>=b:return 0
+    end=min(limit,len(data)-a,len(data)-b);l=0
+    while l<end and data[a+l]==data[b+l]:l+=1
     return l
 
 def _build_index(data,per_key=8):
+    # Compatibility helper; the live parser uses a causal index below.
     index={}
     for p in range(max(0,len(data)-MIN_MATCH+1)):
-        key=data[p:p+MIN_MATCH]
-        bucket=index.get(key)
-        if bucket is None: index[key]=deque((p,),maxlen=per_key)
-        else: bucket.append(p)
+        key=data[p:p+MIN_MATCH];bucket=index.get(key)
+        if bucket is None:index[key]=deque((p,),maxlen=per_key)
+        else:bucket.append(p)
     return index
 
-def _candidates(data,i,window,max_match,max_chain,reps,index,stats,full_limit=3):
-    n=len(data); limit=min(max_match,n-i); out=[]
+def _candidates(data,i,window,max_match,max_chain,reps,index,stats):
+    n=len(data);limit=min(max_match,n-i);out=[]
     for ri,d in enumerate(reps[:2]):
         if 0<d<=i and d<=window:
-            stats['full_match_checks']+=1
-            l=_match_length(data,i-d,i,limit)
-            if l>=MIN_MATCH: out.append((l,d,ri))
+            stats['full_match_checks']+=1;l=_match_length(data,i-d,i,limit)
+            if l>=MIN_MATCH:out.append((l,d,ri))
     if i+MIN_MATCH>n:return out
-    positions=index.get(data[i:i+MIN_MATCH],()); lower=max(0,i-window)
+    positions=index.get(data[i:i+MIN_MATCH],());lower=max(0,i-window)
     stats['index_candidates']+=len(positions)
-    prefix_len=min(8,limit); prefix=data[i:i+prefix_len]; survivors=[]
+    # The index is causal: every stored position is already < i.
+    prefix_len=min(8,limit);prefix=data[i:i+prefix_len];survivors=[]
     for p in reversed(positions):
-        # The current position must never be a source. It also must be behind i.
-        if p>=i or p<lower: continue
+        if p<lower:continue
         stats['prefix_checks']+=1
         if data[p:p+prefix_len]==prefix:
-            stats['prefix_hits']+=1; survivors.append(p)
-            if len(survivors)>=min(max_chain,full_limit):break
-    for p in survivors[:full_limit]:
-        stats['full_match_checks']+=1
-        l=_match_length(data,p,i,limit)
-        d=i-p
-        if l>=MIN_MATCH and 0<d<=window:
-            out.append((l,d,-1))
+            stats['prefix_hits']+=1;survivors.append(p)
+            if len(survivors)>=max_chain:break
+    for p in survivors:
+        stats['full_match_checks']+=1;l=_match_length(data,p,i,limit);d=i-p
+        if l>=MIN_MATCH and 0<d<=window:out.append((l,d,-1))
     stats['matches_found']+=len(out)
     if out:stats['max_match']=max(stats['max_match'],max(x[0] for x in out))
     return out
@@ -59,7 +55,7 @@ def _choose(data,i,lookahead,window,max_chain,max_match,reps,index,stats):
         length=min(length,lookahead,len(data)-i)
         if length<MIN_MATCH or d<=0 or d>i or d>window:continue
         cost=_token_bits(length,d,ri);gain=8*length-cost
-        if gain>best_gain or (gain==best_gain and cost<best_cost):
+        if gain>best_gain or(gain==best_gain and cost<best_cost):
             best_gain=gain;best_cost=cost;best_tok=(REP,length,ri) if ri>=0 else (MATCH,length,d)
     stats['last_cost']=best_cost;stats['last_gain']=best_gain
     return best_tok,best_cost
@@ -71,12 +67,16 @@ def tokenize_bounded(data,lookahead=32,window_size=DEFAULT_WINDOW,max_chain=16,m
     if lookahead<1 or max_chain<1 or index_per_key<1:raise ValueError('lookahead, max_chain and index_per_key must be >= 1')
     n=len(data)
     if not n:return []
-    started=time.perf_counter();index=_build_index(data,index_per_key)
+    started=time.perf_counter()
+    # Causal index: only positions already consumed can be references.
+    index={}
     stats={'candidates':0,'last_candidates':0,'index_candidates':0,'prefix_checks':0,'prefix_hits':0,'full_match_checks':0,'matches_found':0,'max_match':0,'last_cost':8,'last_gain':0}
     selected={LIT:0,MATCH:0,REP:0};tokens=[];reps=[];i=0;last_report=-progress_every
-    if progress:print(f'[DE2-OPT] start bytes={n:,} lookahead={lookahead} chain={max_chain} index_per_key={index_per_key} indexed={len(index):,} keys')
+    if progress:print(f'[DE2-OPT] start bytes={n:,} lookahead={lookahead} chain={max_chain} index_per_key={index_per_key} causal_index')
     while i<n:
         tok,cost=_choose(data,i,lookahead,window_size,max_chain,max_match,reps,index,stats);tokens.append(tok);selected[tok[0]]+=1
+        # Add all newly consumed source positions after choosing the token.
+        start_i=i
         if tok[0]==LIT:i+=1
         elif tok[0]==MATCH:
             d=tok[2]
@@ -86,6 +86,11 @@ def tokenize_bounded(data,lookahead=32,window_size=DEFAULT_WINDOW,max_chain=16,m
         else:
             if tok[2]==1 and len(reps)>1:reps[0],reps[1]=reps[1],reps[0]
             i+=tok[1]
+        end_index=min(i,n-MIN_MATCH+1)
+        for p in range(start_i,end_index):
+            key=data[p:p+MIN_MATCH];bucket=index.get(key)
+            if bucket is None:index[key]=deque((p,),maxlen=index_per_key)
+            else:bucket.append(p)
         if progress and(i-last_report>=progress_every or i>=n):
             elapsed=time.perf_counter()-started;speed=i/1024/elapsed if elapsed else 0;pct=100*i/n
             if tok[0]==LIT:name,detail='LIT',f'byte=0x{tok[1]:02x}'
