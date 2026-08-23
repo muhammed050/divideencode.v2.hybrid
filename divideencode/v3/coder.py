@@ -1,25 +1,4 @@
-"""DE3-derived real token coder for the V3 merged-token experiment.
-
-This is the useful part of the DE3 real-coder work, transplanted without
-changing the stable V3 production frame. It serializes a token stream using
-one merged canonical-Huffman alphabet:
-
-    literal symbols 0..255
-    MATCH symbol 256
-    REP symbol 257
-
-Match parameters use bounded unsigned Exp-Golomb codes. The coder is
-self-contained and deterministic and does not use zlib or another compressor
-as an oracle. It is deliberately kept as a research component until the V3
-matcher is wired to emit the merged token stream and the new frame is proven
-against the full regression suite.
-
-Token tuples are compatible with the historical DE3/V2 tokenizer contract:
-    (0, byte_value)             literal
-    (1, length, distance)       explicit match
-    (2, length, rep_index)      repeat-distance match
-"""
-
+"""DE3-derived merged token coder used by the V3 representation experiment."""
 from heapq import heapify, heappop, heappush
 
 from ..errors import DivideEncodeError
@@ -28,7 +7,6 @@ LIT = 0
 MATCH = 1
 REP = 2
 MIN_MATCH = 4
-
 MAGIC = b"DE3C"
 VERSION = 1
 
@@ -38,21 +16,21 @@ def _varint(n):
         raise ValueError("varint expects unsigned integer")
     out = bytearray()
     while n >= 0x80:
-        out.append((n & 0x7F) | 0x80)
+        out.append((n & 0x7f) | 0x80)
         n >>= 7
     out.append(n)
     return bytes(out)
 
 
 def _read_varint(data, p):
-    x = 0
+    value = 0
     shift = 0
     while p < len(data):
         b = data[p]
         p += 1
-        x |= (b & 0x7F) << shift
+        value |= (b & 0x7f) << shift
         if not b & 0x80:
-            return x, p
+            return value, p
         shift += 7
         if shift > 63:
             raise DivideEncodeError("varint too long")
@@ -60,47 +38,45 @@ def _read_varint(data, p):
 
 
 def _codes(freq):
-    """Return canonical Huffman encoder/decoder maps."""
-    heap = [[w, s, None, None] for s, w in freq.items()]
-    if not heap:
+    """Build deterministic canonical Huffman encoder and decoder maps."""
+    if not freq:
         return {}, {}
-    if len(heap) == 1:
-        s = heap[0][1]
-        return {s: (0, 1)}, {1: {0: s}}
+    if len(freq) == 1:
+        sym = next(iter(freq))
+        return {sym: (0, 1)}, {(1, 0): sym}
 
+    heap = [[weight, 0, sym, None, None] for sym, weight in sorted(freq.items())]
     heapify(heap)
-    serial = len(heap)
+    serial = 1
     while len(heap) > 1:
         a = heappop(heap)
         b = heappop(heap)
-        node = [a[0] + b[0], serial, a, b]
+        heappush(heap, [a[0] + b[0], serial, None, a, b])
         serial += 1
-        heappush(heap, node)
 
     lengths = {}
-
-    def walk(node, depth):
-        if node[2] is None:
-            lengths[node[1]] = depth
+    stack = [(heap[0], 0)]
+    while stack:
+        node, depth = stack.pop()
+        if node[2] is not None:
+            lengths[node[2]] = depth
         else:
-            walk(node[2], depth + 1)
-            walk(node[3], depth + 1)
+            stack.append((node[4], depth + 1))
+            stack.append((node[3], depth + 1))
 
-    walk(heap[0], 0)
     if max(lengths.values()) > 255:
         raise DivideEncodeError("Huffman tree too deep")
 
-    ordered = sorted(lengths.items(), key=lambda x: (x[1], x[0]))
-    code = 0
-    prev = 0
     enc = {}
     dec = {}
-    for sym, ln in ordered:
-        code <<= ln - prev
-        enc[sym] = (code, ln)
-        dec.setdefault(ln, {})[code] = sym
+    code = 0
+    prev = 0
+    for sym, length in sorted(lengths.items(), key=lambda x: (x[1], x[0])):
+        code <<= length - prev
+        enc[sym] = (code, length)
+        dec[(length, code)] = sym
         code += 1
-        prev = ln
+        prev = length
     return enc, dec
 
 
@@ -117,25 +93,25 @@ class _Bits:
         self.n += width
         while self.n >= 8:
             self.n -= 8
-            self.buf.append((self.acc >> self.n) & 0xFF)
+            self.buf.append((self.acc >> self.n) & 0xff)
             self.acc &= (1 << self.n) - 1 if self.n else 0
 
     def finish(self):
         pad = (8 - self.n) & 7
         if self.n:
-            self.buf.append((self.acc << pad) & 0xFF)
+            self.buf.append((self.acc << pad) & 0xff)
         return bytes(self.buf), pad
 
 
 def _read_bits(data, bitpos, width, end):
-    v = 0
+    value = 0
     for _ in range(width):
         if bitpos >= end:
             raise DivideEncodeError("truncated bitstream")
-        p = bitpos >> 3
-        v = (v << 1) | ((data[p] >> (7 - (bitpos & 7))) & 1)
+        byte = data[bitpos >> 3]
+        value = (value << 1) | ((byte >> (7 - (bitpos & 7))) & 1)
         bitpos += 1
-    return v, bitpos
+    return value, bitpos
 
 
 def _eg_put(bits, value):
@@ -148,74 +124,76 @@ def _eg_put(bits, value):
 
 
 def _eg_get(data, bitpos, end):
-    z = 0
+    zeros = 0
     while True:
         b, bitpos = _read_bits(data, bitpos, 1, end)
         if b:
             break
-        z += 1
-        if z > 63:
+        zeros += 1
+        if zeros > 63:
             raise DivideEncodeError("invalid Exp-Golomb code")
-    tail, bitpos = _read_bits(data, bitpos, z, end)
-    return ((1 << z) | tail) - 1, bitpos
+    tail, bitpos = _read_bits(data, bitpos, zeros, end)
+    return ((1 << zeros) | tail) - 1, bitpos
 
 
 def _freq(tokens):
-    f = {}
-    for t in tokens:
-        if not t:
+    freq = {}
+    for token in tokens:
+        if not token:
             raise DivideEncodeError("empty token")
-        kind = t[0]
+        kind = token[0]
         if kind == LIT:
-            if len(t) != 2 or not 0 <= t[1] <= 255:
+            if len(token) != 2 or not 0 <= token[1] <= 255:
                 raise DivideEncodeError("invalid literal token")
-            sym = t[1]
+            sym = token[1]
         elif kind == MATCH:
-            if len(t) != 3 or t[1] < MIN_MATCH or t[2] < 1:
+            if len(token) != 3 or token[1] < MIN_MATCH or token[2] < 1:
                 raise DivideEncodeError("invalid match token")
             sym = 256
         elif kind == REP:
-            if len(t) != 3 or t[1] < MIN_MATCH or not 0 <= t[2] <= 3:
-                raise DivideEncodeError("invalid rep token")
+            if len(token) != 3 or token[1] < MIN_MATCH or not 0 <= token[2] <= 3:
+                raise DivideEncodeError("invalid repeat token")
             sym = 257
         else:
             raise DivideEncodeError("unknown token kind %r" % (kind,))
-        f[sym] = f.get(sym, 0) + 1
-    return f
+        freq[sym] = freq.get(sym, 0) + 1
+    return freq
 
 
 def encode_tokens(tokens):
-    """Encode tokens to a self-contained deterministic DE3C bitstream."""
+    """Encode a token sequence using one merged canonical-Huffman alphabet."""
     tokens = list(tokens)
     freq = _freq(tokens)
+    if not tokens:
+        return MAGIC + bytes([VERSION]) + _varint(0) + _varint(0) + _varint(0) + b"\x00"
+
     codes, _ = _codes(freq)
     bits = _Bits()
-
-    for t in tokens:
-        kind = t[0]
-        sym = t[1] if kind == LIT else (256 if kind == MATCH else 257)
+    for token in tokens:
+        kind = token[0]
+        sym = token[1] if kind == LIT else (256 if kind == MATCH else 257)
         code, width = codes[sym]
         bits.put(code, width)
         if kind == LIT:
             continue
-        _eg_put(bits, t[1] - MIN_MATCH)
-        _eg_put(bits, t[2] - 1 if kind == MATCH else t[2])
+        _eg_put(bits, token[1] - MIN_MATCH)
+        _eg_put(bits, token[2] - 1 if kind == MATCH else token[2])
 
     payload, pad = bits.finish()
     header = bytearray(MAGIC)
     header.append(VERSION)
     header += _varint(len(tokens))
     header += _varint(len(codes))
-    for sym, (_, ln) in sorted(codes.items()):
+    for sym, (_, length) in sorted(codes.items()):
         header += _varint(sym)
-        header.append(ln)
+        header.append(length)
     header += _varint(len(payload))
     header.append(pad)
     return bytes(header) + payload
 
 
 def decode_tokens(blob):
-    """Decode a DE3C bitstream and rebuild the token list."""
+    """Decode a DE3C stream and rebuild the original token tuples."""
     data = memoryview(blob)
     if len(data) < 5 or bytes(data[:4]) != MAGIC or data[4] != VERSION:
         raise DivideEncodeError("invalid DE3 coder header")
@@ -223,54 +201,69 @@ def decode_tokens(blob):
     p = 5
     count, p = _read_varint(data, p)
     nsym, p = _read_varint(data, p)
-    if nsym == 0 or nsym > 258:
+
+    if count == 0:
+        if nsym != 0:
+            raise DivideEncodeError("invalid empty DE3 alphabet")
+        payload_len, p = _read_varint(data, p)
+        if p >= len(data):
+            raise DivideEncodeError("truncated DE3 header")
+        pad = data[p]
+        p += 1
+        if payload_len != 0 or pad != 0 or p != len(data):
+            raise DivideEncodeError("invalid empty DE3 payload")
+        return []
+
+    if not 1 <= nsym <= 258:
         raise DivideEncodeError("invalid DE3 alphabet size")
 
     lengths = {}
     for _ in range(nsym):
         sym, p = _read_varint(data, p)
-        if sym > 257 or p >= len(data):
+        if sym > 257 or sym in lengths or p >= len(data):
             raise DivideEncodeError("invalid DE3 symbol table")
-        ln = data[p]
+        length = data[p]
         p += 1
-        if ln == 0 or sym in lengths:
+        if length == 0:
             raise DivideEncodeError("invalid DE3 code length")
-        lengths[sym] = ln
+        lengths[sym] = length
 
     payload_len, p = _read_varint(data, p)
     if p >= len(data):
         raise DivideEncodeError("truncated DE3 header")
     pad = data[p]
     p += 1
-    if pad > 7 or payload_len != len(data) - p:
+    if pad > 7 or payload_len != len(data) - p or payload_len == 0:
         raise DivideEncodeError("invalid DE3 payload")
 
     ordered = sorted(lengths.items(), key=lambda x: (x[1], x[0]))
     dec = {}
     code = 0
     prev = 0
-    for sym, ln in ordered:
-        code <<= ln - prev
-        dec[(ln, code)] = sym
+    for sym, length in ordered:
+        if length < prev:
+            raise DivideEncodeError("invalid DE3 code lengths")
+        code <<= length - prev
+        dec[(length, code)] = sym
         code += 1
-        prev = ln
+        prev = length
     if code > (1 << prev):
         raise DivideEncodeError("oversubscribed DE3 Huffman table")
 
+    # Header is byte-aligned. Decode only the declared payload, not the header.
+    bitpos = p * 8
+    end = (p + payload_len) * 8 - pad
     out = []
-    bitpos = 0
-    end = len(data) * 8 - pad
     while len(out) < count:
         code = 0
         found = None
-        for ln in range(1, 256):
+        for length in range(1, 256):
             if bitpos >= end:
                 raise DivideEncodeError("truncated DE3 tokens")
-            b, bitpos = _read_bits(data, bitpos, 1, end)
-            code = (code << 1) | b
-            sym = dec.get((ln, code))
-            if sym is not None:
-                found = sym
+            bit, bitpos = _read_bits(data, bitpos, 1, end)
+            code = (code << 1) | bit
+            found = dec.get((length, code))
+            if found is not None:
                 break
         if found is None:
             raise DivideEncodeError("invalid DE3 Huffman code")
@@ -279,32 +272,28 @@ def decode_tokens(blob):
             out.append((LIT, found))
         elif found == 256:
             length, bitpos = _eg_get(data, bitpos, end)
-            dist, bitpos = _eg_get(data, bitpos, end)
-            out.append((MATCH, length + MIN_MATCH, dist + 1))
+            distance, bitpos = _eg_get(data, bitpos, end)
+            out.append((MATCH, length + MIN_MATCH, distance + 1))
         elif found == 257:
             length, bitpos = _eg_get(data, bitpos, end)
-            idx, bitpos = _eg_get(data, bitpos, end)
-            if idx > 3:
+            index, bitpos = _eg_get(data, bitpos, end)
+            if index > 3:
                 raise DivideEncodeError("invalid DE3 repeat index")
-            out.append((REP, length + MIN_MATCH, idx))
+            out.append((REP, length + MIN_MATCH, index))
         else:
             raise DivideEncodeError("invalid DE3 symbol")
 
-    if bitpos != end:
-        # The encoder emits no data after the declared token sequence. Padding
-        # is the only permitted tail; reject real trailing bits to avoid
-        # accepting ambiguous/corrupted streams.
-        remaining = end - bitpos
-        if remaining > 0:
-            tail, _ = _read_bits(data, bitpos, remaining, end)
-            if tail:
-                raise DivideEncodeError("non-zero trailing DE3 bits")
+    if bitpos < end:
+        tail, _ = _read_bits(data, bitpos, end - bitpos, end)
+        if tail:
+            raise DivideEncodeError("non-zero trailing DE3 bits")
+    elif bitpos > end:
+        raise DivideEncodeError("DE3 payload overrun")
 
     return out
 
 
 def encoded_size(tokens):
-    """Return the exact serialized size of the DE3C token stream."""
     return len(encode_tokens(tokens))
 
 
