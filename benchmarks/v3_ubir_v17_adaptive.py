@@ -1,17 +1,22 @@
 """V1.7 DE2-oriented adaptive routing experiment.
 
+The important distinction here is:
+  * UBIR is the representation layer.
+  * DE2 is the downstream compressor.
+
+Therefore DE2 must be measured with divideencode.de2.compress(), not by
+feeding an already-binary UBIR blob back into the UBIR codec.  The latter
+was the source of the bogus multi-megabyte JSON result in the previous
+benchmark.
+
 Research only: compare direct DE2 with UBIR V1.6 -> DE2 and record the
 candidate that produces the smallest DE2 output. IR size is diagnostic only.
-
-A suffix is only a routing hint: the universal codec may still reject the
-actual bytes (for example, a non-canonical CSV). Such a candidate is marked
-unsupported instead of aborting the complete corpus benchmark.
 """
 from __future__ import annotations
 import time
 from pathlib import Path
+from divideencode.de2 import compress
 from divideencode.v3 import ubir_v16 as v16
-from divideencode.v3 import universal_binary_ir as de
 
 ROOT = Path(__file__).resolve().parents[1]
 CORPUS = ROOT / "benchmarks" / "corpus"
@@ -22,77 +27,57 @@ def kind_for(path: Path) -> str | None:
     s = path.suffix.lower()
     if s in {".json", ".jsonl"}:
         return "json"
-    if s == ".csv":
-        return "csv"
     return None
 
 
-def de2(blob: bytes, kind: str):
+def de2(blob: bytes):
+    """Compress one byte stream with the real DE2 backend and verify it."""
     t = time.perf_counter()
-    packed = de.encode(blob, kind)
+    packed = compress(blob, block_size=1 << 20, level="BALANCED")
     et = time.perf_counter() - t
+    # DE2 has its own decoder; keep the benchmark honest with a roundtrip.
+    from divideencode.de2 import decompress
     t = time.perf_counter()
-    out = de.decode(packed)
+    out = decompress(packed)
     dt = time.perf_counter() - t
     if out != blob:
-        raise AssertionError(f"DE2 roundtrip mismatch for kind={kind}")
+        raise AssertionError("DE2 roundtrip mismatch")
     return len(packed), et, dt
-
-
-def try_de2(blob: bytes, kind: str):
-    """Return DE2 metrics, or None when the input is not accepted by the codec."""
-    try:
-        return de2(blob, kind)
-    except (ValueError, UnicodeError, UnicodeDecodeError) as exc:
-        print(f"  direct DE2 unsupported/incompatible: {exc}")
-        return None
 
 
 def main():
     print("V1.7 DE2-ORIENTED ADAPTIVE ROUTING")
     print("criterion=final_DE2_size; IR_size_is_diagnostic_only")
-    print("dispatch: .json/.jsonl -> json, .csv -> csv; unsupported candidates are skipped")
+    print("direct candidate = DE2(data); JSON candidate = DE2(V1.6(data))")
 
     for path in FILES:
         data = path.read_bytes()
         kind = kind_for(path)
         print(f"\n{path.name}")
 
-        if kind is None:
-            print("  direct DE2=unsupported by universal codec")
-            print("  adaptive winner=unsupported")
-            continue
+        # Baseline: every corpus file gets a fair direct-DE2 measurement.
+        direct, det, ddt = de2(data)
+        print(f"  direct DE2={direct:7d} B encode={det:.2f}s de2={ddt:.2f}s")
 
-        direct_result = try_de2(data, kind)
-        if direct_result is None:
-            print("  adaptive winner=unsupported")
-            continue
-
-        direct, det, ddt = direct_result
-        print(f"  direct DE2={direct:7d} B encode={det:.2f}s de2={ddt:.2f}s kind={kind}")
-
-        # V1.6 is currently JSON-only. Never force other formats through it.
-        if kind == "json":
-            t = time.perf_counter()
-            ir = v16.encode(data, "json")
-            iet = time.perf_counter() - t
-            packed_result = try_de2(ir, "json")
-            if packed_result is None:
-                print("  V1.6 -> DE2 unsupported/incompatible")
-                print("  adaptive winner=direct")
-                continue
-
-            packed, pet, pdt = packed_result
-            recovered = v16.decode(ir)
-            if recovered != data:
-                raise AssertionError("V1.6 roundtrip mismatch")
-            print(f"  V1.6  IR={len(ir):7d} B DE2={packed:7d} B "
-                  f"delta={packed-direct:+7d} B encode={iet:.2f}s de2={pdt:.2f}s")
-            winner = "direct" if direct <= packed else "V1.6"
-            print(f"  adaptive winner={winner}")
-        else:
-            print("  V1.6  unsupported (not JSON) -> adaptive keeps direct")
+        # V1.6 is intentionally restricted to JSON for this experiment.
+        if kind != "json":
+            print("  V1.6 candidate=skipped (V1.6 currently JSON-only)")
             print("  adaptive winner=direct")
+            continue
+
+        t = time.perf_counter()
+        ir = v16.encode(data, kind)
+        iet = time.perf_counter() - t
+        if v16.decode(ir) != data:
+            raise AssertionError("V1.6 roundtrip mismatch")
+
+        packed, pet, pdt = de2(ir)
+        print(
+            f"  V1.6  IR={len(ir):7d} B DE2={packed:7d} B "
+            f"delta={packed-direct:+7d} B encode={iet:.2f}s de2={pdt:.2f}s"
+        )
+        winner = "direct" if direct <= packed else "V1.6"
+        print(f"  adaptive winner={winner}")
 
 
 if __name__ == "__main__":
