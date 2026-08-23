@@ -62,9 +62,6 @@ def _rle_decode(src):
 
 def _lanes_encode(src,width): return b"".join(src[i::width] for i in range(width))
 def _lanes_decode(src,width,original_size=None):
-    # BYTE_LANES is strictly length preserving.  It must reconstruct the
-    # length of the payload at this stage, never the final source length:
-    # variable-length transforms may exist before/after it in a pipeline.
     n=len(src) if original_size is None else original_size
     if n<0 or len(src)!=n: raise IRFormatError("lane payload size mismatch")
     lengths=[(n+width-1-i)//width for i in range(width)]
@@ -77,7 +74,6 @@ def _lanes_decode(src,width,original_size=None):
     return bytes(out)
 
 def _bitplane_encode_compiler(src):
-    """Encode BITPLANE with an exact source-size header."""
     return _BITPLANE_MAGIC + struct.pack("<Q", len(src)) + transform(src, Kind.BITPLANE)
 
 def _bitplane_decode_compiler(src):
@@ -94,15 +90,9 @@ def _apply_one(src,op,decode=False,original_size=None):
     if op in (Op.DELTA8,Op.XOR8,Op.NIBBLE,Op.TRANSPOSE4,Op.TRANSPOSE8,Op.STRIDE2,Op.STRIDE4,Op.STRIDE8):
         kind=Kind(op.value)
         if decode and op==Op.NIBBLE:
-            # NIBBLE is exactly 2x on encode, so its own payload determines
-            # the size of the stage being decoded. Do not use the pipeline's
-            # final original_size here.
             return inverse(src,kind,original_size=len(src)//2)
         if decode and op in (Op.STRIDE2,Op.STRIDE4,Op.STRIDE8):
             return inverse(src,kind,original_size=len(src))
-        # DELTA/XOR/TRANSPOSE are length-preserving. Passing the final
-        # pipeline size here used to truncate composed pipelines such as
-        # NIBBLE -> DELTA8. Let inverse preserve the current stage length.
         return inverse(src,kind) if decode else transform(src,kind)
     if op in (Op.DELTA16,Op.DELTA32,Op.DELTA64,Op.XOR16,Op.XOR32,Op.XOR64,Op.SWAP16,Op.SWAP32,Op.SWAP64):
         name=op.name; width=int(name[-2:])//8; action="delta" if name.startswith("DELTA") else "xor" if name.startswith("XOR") else "swap"
@@ -179,5 +169,14 @@ def plan(data,max_candidates=32):
         if len(result)>=max_candidates:break
     return result or [Pipeline(())]
 
-def compile_ir(data,pipeline):
-    src=bytes(data); payload=encode_pipeline(src,pipeline); verify_pipeline(src,pipeline); return CompiledIR(payload,pipeline,len(src))
+def compile_ir(data,pipeline,*,verify=True):
+    """Compile input to a reversible UBIR pipeline.
+
+    Verification is enabled by default for the public API.  Search code can
+    disable it because the selected candidate is ultimately verified through
+    the final DE2 container decode; this avoids a second full transform/decode
+    pass for every rejected candidate.
+    """
+    src=bytes(data); payload=encode_pipeline(src,pipeline)
+    if verify: verify_pipeline(src,pipeline)
+    return CompiledIR(payload,pipeline,len(src))
