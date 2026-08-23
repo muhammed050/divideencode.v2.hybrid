@@ -101,8 +101,7 @@ def encode(data: bytes, phrase_len: int = DEFAULT_PHRASE_LEN,
     return bytes(out), bytes(meta)
 
 
-def decode(data: bytes, meta: bytes, original_len: int) -> bytes:
-    """Reverse a phrase IR representation."""
+def _read_meta(meta: bytes):
     blob = bytes(meta)
     if len(blob) < 2 or blob[:1] != MAGIC:
         raise CorruptedError("bad phrase metadata")
@@ -121,6 +120,18 @@ def decode(data: bytes, meta: bytes, original_len: int) -> bytes:
     transformed_len, pos = decode_varint(blob, pos, len(blob))
     if pos != len(blob):
         raise CorruptedError("trailing phrase metadata")
+    return dictionary, transformed_len
+
+
+def transformed_length(meta: bytes) -> int:
+    """Return the exact post-IR length stored in phrase metadata."""
+    _dictionary, n = _read_meta(meta)
+    return n
+
+
+def decode(data: bytes, meta: bytes, original_len: int) -> bytes:
+    """Reverse a phrase IR representation."""
+    dictionary, transformed_len = _read_meta(meta)
     if transformed_len != len(data):
         raise CorruptedError("phrase transformed size mismatch")
 
