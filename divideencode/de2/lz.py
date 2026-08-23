@@ -46,13 +46,14 @@ REP_INIT = (1, 2, 4, 8)
 _LIT_COST = 4                    # literal bits proxy for distance-bias rule
 
 # level -> knobs; budget_floor bounds the adaptive probe budget
-# (floor == max_chain disables shrinking: BALANCED/MAX always search deep)
+# (floor == max_chain disables shrinking: BALANCED/MAX always search deep);
+# insert_shift doubles the interior-match hash-insertion stride
 _LEVEL_FAST = dict(max_chain=6, lazy=False, nice_len=24, good_len=8,
-                   insert_step=3, budget_floor=2)
+                   insert_step=3, budget_floor=2, insert_shift=0)
 _LEVEL_BALANCED = dict(max_chain=32, lazy=True, nice_len=96, good_len=24,
-                       insert_step=0, budget_floor=32)
+                       insert_step=0, budget_floor=32, insert_shift=0)
 _LEVEL_MAX = dict(max_chain=512, lazy=True, nice_len=4096, good_len=128,
-                  insert_step=0, budget_floor=512)
+                  insert_step=0, budget_floor=512, insert_shift=0)
 LEVELS = {"FAST": _LEVEL_FAST, "BALANCED": _LEVEL_BALANCED,
           "MAX": _LEVEL_MAX}
 
@@ -95,6 +96,7 @@ def _tokenize(data, window=DEFAULT_WINDOW, max_chain=MAX_CHAIN, lazy=LAZY,
     nice_len = cfg["nice_len"]
     good_len = cfg["good_len"]
     forced_step = cfg["insert_step"]
+    ins_shift = cfg["insert_shift"]
     budget_floor = cfg["budget_floor"]
 
     n = len(data)
@@ -286,7 +288,7 @@ def _tokenize(data, window=DEFAULT_WINDOW, max_chain=MAX_CHAIN, lazy=LAZY,
             end_ins = stop
         step = forced_step
         if not step:
-            step = 1 if L <= 16 else (2 if L <= 64 else 4)
+            step = (1 if L <= 16 else (2 if L <= 64 else 4)) << ins_shift
         j = p + 1
         if j < ins_upto:
             j += ((ins_upto - j + step - 1) // step) * step
