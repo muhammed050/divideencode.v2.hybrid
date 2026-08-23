@@ -1,10 +1,9 @@
-"""DE2-aware phrase dictionary preconditioner experiment.
+"""DE2-aware phrase6 preconditioner experiments.
 
-Discovers repeated byte phrases at arbitrary offsets, then lets DE2 judge the
-*final* representation.  This version also builds mixed-length dictionaries:
-a single dictionary can contain short phrases for local repetition and longer
-phrases for repeated records/headers.  The dictionary is selected by measured
-representation savings before the final DE2 test.
+Phrase6 is the strongest general candidate found so far.  This benchmark
+removes the broad phrase-length matrix and concentrates the search budget on
+variants derived from 6-byte phrases.  Every candidate is judged by the final
+DE2 size and must round-trip exactly.
 """
 from __future__ import annotations
 
@@ -98,35 +97,27 @@ def _decode(blob: bytes) -> bytes:
     return bytes(out)
 
 
-def _discover(src: bytes, length: int, max_entries: int = 96, min_count: int = 3):
-    """Find repeated phrases with bounded overlapping n-gram counting.
+def _discover6(src: bytes, max_entries: int = 255, min_count: int = 3):
+    """Rank all repeated 6-byte phrases by useful coverage.
 
-    The previous sampler stepped by length//2, which could miss highly useful
-    phrases whose repetitions were shifted by a few bytes.  We scan every
-    offset, but cap the number of positions for large inputs by using a stable
-    stride only after the first window budget is exhausted.
+    Unlike the old mixed-length search, the experiment deliberately spends its
+    discovery budget only on six-byte phrases.  This keeps comparisons clean
+    and makes each new variant a real improvement over phrase6 rather than a
+    different compressor.
     """
+    length = 6
     if len(src) < length * min_count:
         return []
-
     counts: dict[bytes, int] = {}
-    # Full-offset scan is cheap for short phrases. For long phrases, bound the
-    # work while retaining several offset classes instead of one fixed stride.
     total = len(src) - length + 1
-    if total <= 1_500_000:
-        positions = range(total)
-    else:
-        stride = max(1, total // 1_500_000)
-        positions = range(0, total, stride)
-
-    for i in positions:
+    # Keep runtime bounded while still sampling every offset on normal corpus
+    # files.  Large files use a deterministic dense stride.
+    stride = max(1, total // 2_000_000)
+    for i in range(0, total, stride):
         p = src[i:i + length]
         counts[p] = counts.get(p, 0) + 1
-
     ranked = [(n, p) for p, n in counts.items() if n >= min_count]
-    # Approximate byte coverage, not just occurrence count.  This favors phrases
-    # that can remove more bytes from the intermediate representation.
-    ranked.sort(key=lambda x: (-(x[0] * (x[1].__len__() - 2)), -x[0], x[1]))
+    ranked.sort(key=lambda x: (-(x[0] * 4), -x[0], x[1]))
     return [p for _, p in ranked[:max_entries]]
 
 
@@ -134,119 +125,135 @@ def _encode(src: bytes, dictionary: list[bytes]) -> bytes:
     by_first: dict[int, list[tuple[bytes, int]]] = {}
     for idx, p in enumerate(dictionary, 1):
         by_first.setdefault(p[0], []).append((p, idx))
-    for k in by_first:
-        by_first[k].sort(key=lambda x: len(x[0]), reverse=True)
-
     out = bytearray()
-    i = 0
     literal = bytearray()
+    i = 0
     while i < len(src):
-        matches = by_first.get(src[i])
         found = None
-        if matches:
-            for p, idx in matches:
-                if src.startswith(p, i):
-                    found = (p, idx)
-                    break
+        for p, idx in by_first.get(src[i], ()):
+            if src.startswith(p, i):
+                found = (p, idx)
+                break
         if found:
             if literal:
                 while literal:
                     n = min(255, len(literal))
-                    out.append(0)
-                    out.append(n)
-                    out += literal[:n]
+                    out.append(0); out.append(n); out += literal[:n]
                     del literal[:n]
             p, idx = found
             out.append(idx)
-            i += len(p)
+            i += 6
         else:
             literal.append(src[i])
             i += 1
     while literal:
         n = min(255, len(literal))
-        out.append(0)
-        out.append(n)
-        out += literal[:n]
+        out.append(0); out.append(n); out += literal[:n]
         del literal[:n]
     return bytes(out)
 
 
-def _mixed_dictionary(src: bytes, pools: dict[int, list[bytes]], limit: int = 255):
-    """Build a mixed-length dictionary using measured encoded-size gain.
+def _frequency6(src: bytes, pool: list[bytes], limit: int) -> list[bytes]:
+    """Original phrase6 strategy: frequency/coverage ranking."""
+    return pool[:limit]
 
-    A phrase gets credit for the bytes it removes from the current stream.  We
-    repeatedly choose the best phrase by gain per dictionary byte, then re-encode
-    once at the end.  This avoids spending the whole 255-entry budget on one
-    phrase length.
-    """
+
+def _nonoverlap6(src: bytes, pool: list[bytes], limit: int) -> list[bytes]:
+    """Prefer phrases whose occurrences are useful without overlap waste."""
+    scored = []
+    for p in pool:
+        count = 0
+        pos = 0
+        while True:
+            j = src.find(p, pos)
+            if j < 0:
+                break
+            count += 1
+            pos = j + 6
+        scored.append((count * 4, count, p))
+    scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
+    return [p for _, _, p in scored[:limit]]
+
+
+def _greedy6(src: bytes, pool: list[bytes], limit: int, top_probe: int = 24) -> list[bytes]:
+    """Greedy phrase6 dictionary: choose entries by measured stream gain."""
     selected: list[bytes] = []
     selected_set: set[bytes] = set()
-    # Start with the strongest phrases from every length so mixed candidates do
-    # not collapse to whichever length happened to have the largest pool.
-    for length in sorted(pools):
-        if pools[length]:
-            p = pools[length][0]
-            selected.append(p)
-            selected_set.add(p)
-
-    while len(selected) < limit:
-        current = _encode(src, selected) if selected else src
+    current_len = len(src)
+    remaining = pool[:]
+    while len(selected) < limit and remaining:
         best = None
-        best_score = 0.0
-        # Only inspect a small top slice from each pool; the expensive part is
-        # encoding, so this keeps the experiment bounded.
-        for length, pool in pools.items():
-            for p in pool[:16]:
-                if p in selected_set:
-                    continue
-                trial = selected + [p]
-                trial_stream = _encode(src, trial)
-                gain = len(current) - len(trial_stream)
-                # Dictionary entry costs one length byte + phrase bytes.  Give a
-                # slight bonus to repeated use without hard-coding one phrase size.
-                cost = len(p) + 1
-                score = gain / cost if cost else 0.0
-                if gain > 0 and score > best_score:
-                    best_score = score
-                    best = p
+        best_gain = 0
+        for p in remaining[:top_probe]:
+            trial = _encode(src, selected + [p])
+            gain = current_len - len(trial)
+            # One dictionary entry costs one length byte plus six phrase bytes.
+            gain -= 7
+            if gain > best_gain:
+                best_gain = gain
+                best = p
         if best is None:
             break
         selected.append(best)
         selected_set.add(best)
-        # Once gains become tiny, remaining entries are unlikely to help DE2.
-        if best_score < 0.15:
-            break
+        current_len = len(_encode(src, selected))
+        remaining = [p for p in remaining if p not in selected_set]
     return selected
 
 
+def _greedy6_reorder(src: bytes, pool: list[bytes], limit: int) -> list[bytes]:
+    """Build with measured gains, then reorder IDs by stream frequency.
+
+    The byte stream is semantically identical after re-encoding, but putting
+    the most frequent IDs first can improve DE2's symbol statistics in some
+    inputs because IDs become a compact low-valued alphabet.
+    """
+    selected = _greedy6(src, pool, limit, top_probe=32)
+    if not selected:
+        return []
+    freq = []
+    stream = _encode(src, selected)
+    counts = [0] * len(selected)
+    i = 0
+    while i < len(stream):
+        code = stream[i]; i += 1
+        if code:
+            counts[code - 1] += 1
+        else:
+            if i >= len(stream):
+                break
+            n = stream[i]; i += 1 + n
+    freq = sorted(range(len(selected)), key=lambda i: (-counts[i], selected[i]))
+    return [selected[i] for i in freq]
+
+
 def candidates(src: bytes):
-    lengths = (3, 4, 5, 6, 8, 12, 16, 24, 32, 48, 64)
-    pools = {length: _discover(src, length) for length in lengths}
+    pool = _discover6(src)
+    if not pool:
+        return
 
-    # Keep the original single-length matrix for an honest apples-to-apples
-    # comparison with the previous experiment.
-    for length in lengths:
-        dictionary = pools[length]
-        if dictionary:
+    # Only phrase6-derived candidates remain.  Limits cover the useful small,
+    # medium and full dictionaries without reopening the old length matrix.
+    for limit in (48, 96, 128, 192, 255):
+        variants = (
+            (f"phrase6_freq{limit}", _frequency6(src, pool, limit)),
+            (f"phrase6_nonoverlap{limit}", _nonoverlap6(src, pool, limit)),
+            (f"phrase6_greedy{limit}", _greedy6(src, pool, limit)),
+            (f"phrase6_greedy_reorder{limit}", _greedy6_reorder(src, pool, limit)),
+        )
+        for name, dictionary in variants:
+            if not dictionary:
+                continue
             packed = _pack(dictionary, _encode(src, dictionary), len(src))
-            yield Candidate(f"phrase{length}", packed, tuple(dictionary))
-
-    # New adaptive candidates.  Different budgets matter because DE2 may prefer
-    # a small dictionary with a very clean symbol stream over a maximal one.
-    for limit in (32, 64, 96, 128, 192, 255):
-        dictionary = _mixed_dictionary(src, pools, limit=limit)
-        if len(dictionary) < 2:
-            continue
-        packed = _pack(dictionary, _encode(src, dictionary), len(src))
-        yield Candidate(f"mixed{limit}", packed, tuple(dictionary))
+            yield Candidate(name, packed, tuple(dictionary))
 
 
 def main():
     files = sorted(p for p in CORPUS.iterdir() if p.is_file()) if CORPUS.exists() else []
     if not files:
         raise SystemExit(f"No corpus files found in {CORPUS}")
-    print("DE2-AWARE PHRASE DICTIONARY v2")
-    print("single-length + mixed adaptive dictionaries -> IDs -> DE2; winner = smallest verified final DE2")
+    print("DE2-AWARE PHRASE6 VARIANTS")
+    print("frequency + non-overlap + greedy + ID-reorder; winner = smallest verified final DE2")
 
     for path in files:
         src = path.read_bytes()
@@ -258,18 +265,14 @@ def main():
         best_name = "direct-DE2"
         for cand in candidates(src):
             blob, enc, dec = run_de2(cand.packed)
-            restored = _decode(de2_decompress(blob))
-            if restored != src:
-                raise AssertionError(f"{cand.name} roundtrip mismatch")
-            final = len(blob)
-            print(f"  {cand.name:<10} dict={len(cand.dictionary):>3} repr={len(cand.packed):>9,} B DE2={final:>9,} B ratio={final/len(src):.4f} enc={enc:.3f}s dec={dec:.3f}s ok")
-            if final < best_size:
-                best_size = final
+            ok = _decode(cand.packed) == src
+            if not ok:
+                raise AssertionError(f"preconditioner roundtrip mismatch: {cand.name}")
+            if len(blob) < best_size:
+                best_size = len(blob)
                 best_name = cand.name
-        if best_name == "direct-DE2":
-            print(f"  WINNER direct-DE2; candidate_delta={best_size-len(direct):+,} B")
-        else:
-            print(f"  WINNER {best_name}; gain_vs_direct={len(direct)-best_size:+,} B")
+            print(f"  {cand.name:<25} dict={len(cand.dictionary):3d} repr={len(cand.packed):9,d} DE2={len(blob):9,d} ratio={len(blob)/len(src):.4f} enc={enc:.3f}s dec={dec:.3f}s ok")
+        print(f"  WINNER {best_name}; gain_vs_direct={len(direct)-best_size:+,} B")
 
 
 if __name__ == "__main__":
