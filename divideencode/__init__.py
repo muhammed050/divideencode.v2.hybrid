@@ -5,6 +5,13 @@ from .adaptive_universal import compress as adaptive_compress, decompress as ada
 from .universal_ir import Kind as UniversalIRKind, Candidate as UniversalIRCandidate
 from .universal_ir import transform as universal_ir_transform, inverse as universal_ir_inverse
 from .universal_ir import rank as universal_ir_rank, best as universal_ir_best
+from .universal_binary import SearchMode as UniversalBinarySearchMode
+from .universal_binary import Analysis as UniversalBinaryAnalysis, Result as UniversalBinaryResult
+from .universal_binary import analyze as universal_binary_analyze
+from .universal_binary import rank_candidates as universal_binary_rank_candidates
+from .universal_binary import compress as universal_binary_compress
+from .universal_binary import compress_with_stats as universal_binary_compress_with_stats
+from .universal_binary import decompress as universal_binary_decompress
 from .errors import DivideEncodeError, CorruptedError, NotDivideEncodedError
 from .strategies import render_trace
 
@@ -23,6 +30,14 @@ __all__ = [
     "universal_ir_inverse",
     "universal_ir_rank",
     "universal_ir_best",
+    "UniversalBinarySearchMode",
+    "UniversalBinaryAnalysis",
+    "UniversalBinaryResult",
+    "universal_binary_analyze",
+    "universal_binary_rank_candidates",
+    "universal_binary_compress",
+    "universal_binary_compress_with_stats",
+    "universal_binary_decompress",
     "decompress_with_trace",
     "parse_header",
     "recursive_compress",
