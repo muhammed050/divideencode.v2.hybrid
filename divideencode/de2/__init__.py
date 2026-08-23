@@ -1,23 +1,19 @@
 """DE2 "Fast HYB" compression engine (V2/V3).
 
 Pipeline per block:
-    scan_features -> classify -> ONE transform -> LZ/TSE core ->
-    separated token streams (Huffman literals) -> DE2 block container
+    scan_features -> one universal representation decision ->
+    LZ/TSE core -> separated token streams -> DE2 block container.
 
-Public API:
-    compress(data, block_size=1 MiB) -> DE2 container bytes
-    decompress(blob, verify=True)      -> original bytes
-
-Containers written by this module set FLAG_LZ_V2: MODE_LZ / MODE_DELTA_LZ
-payloads carry v2 frames with a structured distance alphabet (see
-lz.encode_v2). Legacy flags=0 containers (v1 frames) still decode.
-
-V1 is untouched and remains fully functional.
+The universal front-end uses a bounded sample to choose at most one phrase
+representation. It never performs full DE2 trial compression for multiple
+phrase candidates. The selected representation is translated once and sent
+to DE2 once; direct LZ remains the fallback.
 """
 from ..errors import CorruptedError
 from ..patterns import rle_encode, rle_decode
 
 from . import container, entropy, lz, transforms, phrase
+from . import universal_translator
 from .classifier import (MODE_RAW, MODE_RLE, MODE_LZ, MODE_DELTA_LZ,
                          MODE_STRUCT_LZ, classify)
 from .container import (MAGIC, VERSION, FLAG_LZ_V2, parse_header,
@@ -25,42 +21,32 @@ from .container import (MAGIC, VERSION, FLAG_LZ_V2, parse_header,
                         check_block_crc)
 from .features import scan_features
 
-DEFAULT_BLOCK_SIZE = 1048576   # 1 MiB — isolated benchmark branch
+DEFAULT_BLOCK_SIZE = 1048576
 
 
 def _encode_block(data, max_chain=lz.MAX_CHAIN, lazy=lz.LAZY, level=None):
     fs = scan_features(data)
-    mode, hint = classify(fs)
-
+    mode, _hint = classify(fs)
     payload = None
     tmeta = b""
 
-    # Phrase IR is an optional front-end for ordinary/structured byte LZ.
-    # Numeric DELTA+LZ keeps priority because it has a different reversible
-    # model and may be substantially better on counter/sensor data.
-    phrase_eligible = mode in (MODE_LZ, MODE_STRUCT_LZ) and (
-        mode == MODE_STRUCT_LZ or (
-            len(data) >= 4096 and
-            fs.printable_frac >= 0.82 and
-            fs.match_density >= 0.03))
+    # One universal phrase decision. The sample selector chooses one phrase
+    # length (or none); the complete block is then translated exactly once.
+    phrase_eligible = mode in (MODE_LZ, MODE_STRUCT_LZ)
+    phrase_eligible = phrase_eligible and len(data) >= 64
+    phrase_eligible = phrase_eligible and fs.printable_frac >= 0.70
+    phrase_eligible = phrase_eligible and fs.match_density >= 0.01
     if phrase_eligible:
-        transformed, pmeta = phrase.encode(data, phrase_len=6, max_dict=255)
-        if transformed is not None:
-            frame = lz.encode_v2(transformed, max_chain=max_chain,
-                                 lazy=lazy, level=level)
-            phrase_block = write_block(MODE_STRUCT_LZ, pmeta, data, frame)
-            direct_frame = lz.encode_v2(data, max_chain=max_chain,
-                                        lazy=lazy, level=level)
-            direct_block = write_block(MODE_LZ, b"", data, direct_frame)
-            if len(phrase_block) < len(direct_block):
-                return phrase_block
+        k = universal_translator.choose_phrase_length(data)
+        if k is not None:
+            transformed, pmeta = universal_translator.translate_phrase(data, k)
+            if transformed is not None:
+                mode = MODE_STRUCT_LZ
+                payload = lz.encode_v2(transformed, max_chain=max_chain,
+                                       lazy=lazy, level=level)
+                tmeta = pmeta
 
-        # If phrase IR loses, continue with the normal mode selected by the
-        # classifier. STRUCT+LZ safely degrades to ordinary LZ.
-        if mode == MODE_STRUCT_LZ:
-            mode = MODE_LZ
-
-    if mode == MODE_STRUCT_LZ:
+    if mode == MODE_STRUCT_LZ and payload is None:
         mode = MODE_LZ
 
     if mode == MODE_RLE:
@@ -71,16 +57,14 @@ def _encode_block(data, max_chain=lz.MAX_CHAIN, lazy=lz.LAZY, level=None):
             mode = MODE_LZ
 
     if mode == MODE_DELTA_LZ:
-        frame, tmeta = transforms.numeric_encode(
+        payload, tmeta = transforms.numeric_encode(
             data, mono=fs.mono32, hi_gain=fs.delta_ratio, _enc=lz.encode_v2)
-        payload = frame
-        # fall through to size check with the ORIGINAL data length
 
     if mode == MODE_LZ and payload is None:
         payload = lz.encode_v2(data, max_chain=max_chain, lazy=lazy,
                                level=level)
 
-    # RAW fallback rule: never expand a block
+    # Universal invariant: never expand a block.
     if payload is None or len(payload) >= len(data):
         return write_block(MODE_RAW, b"", data, bytes(data))
 
@@ -91,9 +75,8 @@ def compress(data, block_size=DEFAULT_BLOCK_SIZE, max_chain=lz.MAX_CHAIN,
              lazy=lz.LAZY, level="BALANCED"):
     """Compress bytes into a DE2 container.
 
-    block_size defaults to 1 MiB on this isolated benchmark branch.
-    level: "FAST" | "BALANCED" | "MAX" matcher preset (v3). Explicit
-        max_chain/lazy kwargs override the preset for legacy callers.
+    One block receives one representation decision and one final DE2 encode.
+    level: "FAST" | "BALANCED" | "MAX" matcher preset.
     """
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise TypeError("compress expects bytes-like data")
@@ -102,9 +85,8 @@ def compress(data, block_size=DEFAULT_BLOCK_SIZE, max_chain=lz.MAX_CHAIN,
     blocks = []
     for off in range(0, n, block_size):
         chunk = data[off:off + block_size]
-        blob = _encode_block(chunk, max_chain=max_chain, lazy=lazy,
-                             level=level)
-        blocks.append(blob)
+        blocks.append(_encode_block(chunk, max_chain=max_chain,
+                                     lazy=lazy, level=level))
     out = bytearray()
     out += write_header(n, len(blocks), flags=FLAG_LZ_V2)
     for b in blocks:
@@ -147,9 +129,6 @@ def decompress(blob, verify=True):
             if len(data) != raw_len:
                 raise CorruptedError("delta produced wrong block size")
         elif mode == MODE_STRUCT_LZ:
-            # Phrase IR changes the post-transform length, so its exact size
-            # is stored in tmeta and supplied to the LZ decoder before the
-            # dictionary inverse restores raw_len bytes.
             transformed_len = phrase.transformed_length(header.tmeta)
             inner, _p = frame_decode(payload, 0, len(payload),
                                      transformed_len, tables)
