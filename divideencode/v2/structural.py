@@ -202,11 +202,15 @@ def transform(data: bytes) -> bytes:
 def adaptive_transform(data: bytes, scorer=None) -> Decision:
     """Choose the representation that is actually best downstream.
 
-    ``scorer`` receives the exact bytes that will be passed to the downstream
-    compressor and returns its final cost. With a DE2 scorer this compares
-    RAW against every structural representation using the real DE2 size.
+    ``scorer`` receives the exact structural representation that would be
+    passed to the downstream compressor. This deliberately keeps the RAW
+    representation in the same SD1 envelope as the transformed candidates,
+    so the scorer compares like-for-like representations and the returned
+    ``downstream_size`` is the scorer's exact result for the selected blob.
     """
     candidates = analyze(data)
+    raw_blob = _raw_blob(data)
+
     if scorer is None:
         blob = transform(data)
         kind = "raw" if blob[3] == 0 else next(
@@ -214,15 +218,13 @@ def adaptive_transform(data: bytes, scorer=None) -> Decision:
         )
         return Decision(kind, blob, len(blob), None)
 
-    # The raw branch must be scored as the original bytes, not as SD1+raw.
-    # The SD1 wrapper exists only so Decision.blob remains reversible.
-    options = [("raw", _raw_blob(data), data)]
-    options.extend((c.kind, _candidate_blob(c), _candidate_blob(c)) for c in candidates)
+    options = [("raw", raw_blob)]
+    options.extend((c.kind, _candidate_blob(c)) for c in candidates)
 
-    best_kind, best_blob, best_input = options[0]
-    best_cost = scorer(best_input)
-    for kind, blob, downstream_input in options[1:]:
-        cost = scorer(downstream_input)
+    best_kind, best_blob = options[0]
+    best_cost = scorer(best_blob)
+    for kind, blob in options[1:]:
+        cost = scorer(blob)
         if cost < best_cost:
             best_kind, best_blob, best_cost = kind, blob, cost
 
