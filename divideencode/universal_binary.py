@@ -1,8 +1,8 @@
 """UBIR2 -- universal representation compiler for DE2.
 
-UBIR2 is a compiler, not a compressor.  Any input is valid bytes.  It may be
+UBIR2 is a compiler, not a compressor. Any input is valid bytes. It may be
 expanded into a reversible Universal Binary IR program; only the final DE2
-size decides whether that program is selected.  DIRECT remains a mandatory
+size decides whether that program is selected. DIRECT remains a mandatory
 fallback.
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ from enum import IntEnum
 
 from .errors import CorruptedError, NotDivideEncodedError
 from .universal_ir import Kind, transform, inverse
-from .universal_compiler import Pipeline, compile_ir, decode_pipeline, deserialize, plan
+from .universal_compiler import Pipeline, compile_ir, decode_pipeline, plan
 
 MAGIC = b"UB2D"
 VERSION = 2
@@ -200,11 +200,7 @@ def _unpack(blob: bytes) -> tuple[int, int, int, bytes]:
 
 
 def rank_candidates(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, direct_size: int | None = None) -> list[IntEnum]:
-    """Compatibility ranking for the original single-transform API.
-
-    The actual compiler now uses :func:`plan` and evaluates complete IR
-    pipelines.  This function remains available to existing callers.
-    """
+    """Compatibility ranking for the original single-transform API."""
     mode = _normalize_mode(mode)
     candidates: list[IntEnum] = [Kind.DIRECT, Kind.DELTA8, Kind.XOR8, Kind.NIBBLE, Kind.BITPLANE,
                                  Kind.TRANSPOSE4, Kind.TRANSPOSE8, Kind.STRIDE2, Kind.STRIDE4, Kind.STRIDE8,
@@ -218,28 +214,23 @@ def rank_candidates(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED
     return candidates
 
 
-def _legacy_candidates(src: bytes, mode: SearchMode) -> list[_Candidate]:
-    kinds = rank_candidates(src, mode=mode)
-    result: list[_Candidate] = []
-    for kind in kinds[1:]:
-        result.append(_Candidate(kind, _apply_transform(src, kind)))
-    return result
-
-
 def _pipeline_limit(mode: SearchMode) -> int:
     return {SearchMode.FAST: 8, SearchMode.BALANCED: 24, SearchMode.MAX: 64}[mode]
 
 
 def _build_candidates(src: bytes, mode: SearchMode) -> list[_Candidate]:
     candidates: list[_Candidate] = []
-    # Complete programs are the primary representation.  The plan is only a
-    # search bound; final DE2 size is still measured for every program here.
+    # The pipeline planner already includes RAW and all relevant single
+    # transforms. Do not append the legacy single-transform list here: those
+    # candidates duplicate the exact IR payloads and caused needless DE2 work.
+    seen: set[tuple[str, bytes]] = set()
     for pipeline in plan(src, max_candidates=_pipeline_limit(mode)):
-        compiled = compile_ir(src, pipeline)
+        compiled = compile_ir(src, pipeline, verify=False)
+        key = (pipeline.name, compiled.payload)
+        if key in seen:
+            continue
+        seen.add(key)
         candidates.append(_Candidate("IR:" + pipeline.name, compiled.payload, pipeline))
-    # Keep the original transforms as compatibility fallbacks for paths that
-    # predate the v2 compiler.
-    candidates.extend(_legacy_candidates(src, mode))
     return candidates
 
 
@@ -266,9 +257,6 @@ def compress(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, level
         kind_value = int(best.kind)
         payload = best_blob
     else:
-        # Pipeline payload is the DE2 stream followed by a compact pipeline
-        # descriptor.  The descriptor is outside DE2 so DE2 still sees only
-        # the compiled binary IR bytes.
         descriptor = struct.pack("<4sBBQ", b"IRP2", 1, len(best.pipeline.instructions), len(src))
         descriptor += bytes(int(i.op) for i in best.pipeline.instructions)
         payload = descriptor + best_blob
