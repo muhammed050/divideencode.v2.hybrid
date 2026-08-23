@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from divideencode import de2
 from divideencode.de2 import entropy, lz
-from divideencode.bitstream import decode_varint
 
 CORPUS = Path(__file__).parent / "corpus"
 
@@ -58,9 +57,9 @@ def joint_length_potential(rows):
         old = len(entropy.encode_stream(bytes(ll))) + len(entropy.encode_stream(bytes(ml)))
         joint_raw = bytes(ll) + bytes(ml)
         joint = len(entropy.encode_stream(joint_raw))
-        # framing overhead: old has two varint lengths; joint has one.
-        old += len(encode_varint_len(len(ll))) + len(encode_varint_len(len(ml)))
-        joint += len(encode_varint_len(len(joint_raw)))
+        # Framing overhead: old has two varint lengths; joint has one.
+        old += encode_varint_len(len(ll)) + encode_varint_len(len(ml))
+        joint += encode_varint_len(len(joint_raw))
         total_old += old
         total_joint += joint
         print(f"{name:24s} separate={old:8d} joint={joint:8d} delta={joint-old:+7d} B")
