@@ -1,25 +1,14 @@
 """UBIR1 — Universal Binary Intermediate Representation for DE2.
 
-The goal is not to compress by itself.  It rewrites arbitrary bytes into a
-small set of reversible, DE2-friendly representations and lets a cheap
-proxy choose the representation before DE2 sees the data.
+This layer is a reversible *representation compiler*, not a compressor.
+Arbitrary bytes are rewritten into DE2-friendly layouts.  The representation
+is allowed to grow; the downstream DE2 stage decides whether the rewrite was
+worthwhile.
 
-Every input is representable.  The IR may grow; that is intentional.  The
-important property is that structured files can be rearranged into a form
-where DE2 can see locality, repeated bytes, low-valued symbols, or repeated
-bit planes instead of the original byte layout.
-
-Transforms:
-  DIRECT   : original bytes
-  DELTA8   : byte residuals
-  XOR8     : adjacent-byte XOR residuals
-  NIBBLE   : low/high nibbles separated into two planes
-  BITPLANE : eight bit planes, byte-aligned
-  TRANSPOSE: fixed-width byte transpose (4/8-byte lanes)
-
-The transform layer is deliberately deterministic and has no filename or
-content-type assumptions.  A future version can add dictionaries/token IR
-without changing the container contract.
+The first implementation deliberately uses generic transforms only:
+DIRECT, DELTA8, XOR8, NIBBLE_PLANES, BIT_PLANES and 4x4/8x8 byte transposes.
+No filename/type assumptions are required, so the same IR can be used for
+text, source code, structured data and opaque binary data.
 """
 from __future__ import annotations
 
@@ -85,102 +74,81 @@ def _xor_decode(src: bytes) -> bytes:
 
 
 def _nibble_encode(src: bytes) -> bytes:
+    """Separate every byte into a low-nibble plane and a high-nibble plane."""
     n = len(src)
-    out = bytearray(n)
-    half = (n + 1) // 2
-    # Low nibbles first, then high nibbles.  Padding is explicit through n.
+    out = bytearray(2 * n)
     for i, b in enumerate(src):
         out[i] = b & 0x0F
-        if i + half < n:
-            out[i + half] = b >> 4
+        out[n + i] = b >> 4
     return bytes(out)
 
 
-def _nibble_decode(src: bytes) -> bytes:
-    n = len(src)
+def _nibble_decode(src: bytes, original_size: int | None = None) -> bytes:
+    if len(src) % 2:
+        raise ValueError("invalid nibble plane length")
+    n = len(src) // 2
+    if original_size is not None and original_size > n:
+        raise ValueError("invalid nibble original size")
     out = bytearray(n)
-    half = (n + 1) // 2
     for i in range(n):
-        lo = src[i] & 0x0F
-        hi = src[i + half] & 0x0F if i + half < n else 0
-        out[i] = lo | (hi << 4)
-    return bytes(out)
+        out[i] = (src[i] & 0x0F) | ((src[n + i] & 0x0F) << 4)
+    return bytes(out if original_size is None else out[:original_size])
 
 
 def _bitplane_encode(src: bytes) -> bytes:
+    """Transpose each 8-byte group into eight bit-plane bytes.
+
+    A partial final group is padded to eight source bytes.  The container's
+    original-size field tells the inverse exactly how much to trim.
+    """
     n = len(src)
-    out = bytearray(n)
     if not src:
         return b""
-    # Eight planes, each packed as bytes.  Keeping the same total size makes
-    # this transform cheap to frame and avoids bit-level container complexity.
-    # For every group of eight source bytes, emit one byte per bit position.
-    # This is a true transpose of the 8x8 bit matrix.
-    pos = 0
-    while pos < n:
-        block = src[pos:pos + 8]
-        width = len(block)
+    groups = (n + 7) // 8
+    out = bytearray(groups * 8)
+    for g in range(groups):
+        base = g * 8
+        block = src[base:base + 8]
         for bit in range(8):
             v = 0
             for j, b in enumerate(block):
                 if b & (1 << bit):
                     v |= 1 << j
-            out[pos + bit] = v
-        # For short final blocks, the remaining output bytes are unused by
-        # construction; overwrite them deterministically below.
-        if width < 8:
-            for bit in range(width, 8):
-                if pos + bit < n:
-                    out[pos + bit] = 0
-        pos += 8
+            out[base + bit] = v
     return bytes(out)
 
 
-def _bitplane_decode(src: bytes) -> bytes:
-    n = len(src)
-    out = bytearray(n)
-    pos = 0
-    while pos < n:
-        width = min(8, n - pos)
+def _bitplane_decode(src: bytes, original_size: int | None = None) -> bytes:
+    if len(src) % 8:
+        raise ValueError("invalid bit-plane length")
+    out = bytearray((len(src) // 8) * 8)
+    for base in range(0, len(src), 8):
         for bit in range(8):
-            packed = src[pos + bit] if pos + bit < n else 0
-            for j in range(width):
+            packed = src[base + bit]
+            for j in range(8):
                 if packed & (1 << j):
-                    out[pos + j] |= 1 << bit
-        pos += 8
+                    out[base + j] |= 1 << bit
+    if original_size is not None:
+        if original_size > len(out):
+            raise ValueError("invalid bit-plane original size")
+        return bytes(out[:original_size])
     return bytes(out)
 
 
 def _transpose(src: bytes, width: int) -> bytes:
-    n = len(src)
-    out = bytearray(n)
-    pos = 0
-    while pos < n:
-        block = src[pos:pos + width]
-        for col, b in enumerate(block):
-            # Column-major within the block.
-            out[pos + col] = b
-        # For a scalar byte sequence, transpose only has an effect when we
-        # have multiple adjacent records.  The record size is therefore
-        # intentionally fixed at width and implemented as a byte matrix.
-        if len(block) == width:
-            for row in range(width):
-                for col in range(width):
-                    out[pos + row * width + col] = src[pos + col * width + row] if pos + col * width + row < n else 0
-        pos += width * width
+    """Transpose complete width x width byte matrices; leave partial tail raw."""
+    block_size = width * width
+    out = bytearray(src)
+    for base in range(0, len(src) - block_size + 1, block_size):
+        for row in range(width):
+            for col in range(width):
+                out[base + row * width + col] = src[base + col * width + row]
     return bytes(out)
 
 
 def _transpose_decode(src: bytes, width: int) -> bytes:
-    n = len(src)
-    out = bytearray(src)
-    pos = 0
-    while pos + width * width <= n:
-        for row in range(width):
-            for col in range(width):
-                out[pos + col * width + row] = src[pos + row * width + col]
-        pos += width * width
-    return bytes(out)
+    # Matrix transpose is its own inverse.
+    return _transpose(src, width)
 
 
 def transform(src: bytes, kind: Kind) -> bytes:
@@ -202,30 +170,33 @@ def transform(src: bytes, kind: Kind) -> bytes:
     raise ValueError(f"unknown UBIR kind: {kind}")
 
 
-def inverse(src: bytes, kind: Kind) -> bytes:
+def inverse(src: bytes, kind: Kind, *, original_size: int | None = None) -> bytes:
     src = bytes(src)
     if kind == Kind.DIRECT:
-        return src
+        return src if original_size is None else src[:original_size]
     if kind == Kind.DELTA8:
-        return _delta_decode(src)
-    if kind == Kind.XOR8:
-        return _xor_decode(src)
-    if kind == Kind.NIBBLE:
-        return _nibble_decode(src)
-    if kind == Kind.BITPLANE:
-        return _bitplane_decode(src)
-    if kind == Kind.TRANSPOSE4:
-        return _transpose_decode(src, 4)
-    if kind == Kind.TRANSPOSE8:
-        return _transpose_decode(src, 8)
-    raise ValueError(f"unknown UBIR kind: {kind}")
+        out = _delta_decode(src)
+    elif kind == Kind.XOR8:
+        out = _xor_decode(src)
+    elif kind == Kind.NIBBLE:
+        return _nibble_decode(src, original_size)
+    elif kind == Kind.BITPLANE:
+        return _bitplane_decode(src, original_size)
+    elif kind == Kind.TRANSPOSE4:
+        out = _transpose_decode(src, 4)
+    elif kind == Kind.TRANSPOSE8:
+        out = _transpose_decode(src, 8)
+    else:
+        raise ValueError(f"unknown UBIR kind: {kind}")
+    return out if original_size is None else out[:original_size]
 
 
 def _score(data: bytes) -> float:
-    """Cheap DE2-friendliness proxy; lower is better.
+    """Cheap DE2-friendliness score; lower is better.
 
-    It rewards repeated bytes and low-valued bytes without running DE2.
-    Sampling is bounded so candidate generation remains fast on huge files.
+    This is only a ranking proxy.  It intentionally avoids calling DE2, so
+    trying several IRs remains cheap.  It rewards concentration in a few byte
+    values, low-valued symbols and adjacent repetition.
     """
     if not data:
         return 0.0
@@ -235,34 +206,31 @@ def _score(data: bytes) -> float:
         counts[b] += 1
     repeated = sum(c * c for c in counts) / len(sample)
     low = sum(1 for b in sample if b < 16) / len(sample)
-    # Consecutive equality is especially useful for DE2's run/repetition paths.
     runs = sum(sample[i] == sample[i - 1] for i in range(1, len(sample))) / max(1, len(sample) - 1)
-    return len(sample) / (1.0 + repeated * 0.02 + low * 2.0 + runs * 4.0)
+    # Include size softly: an IR that grows substantially must earn that cost.
+    size_penalty = len(data) / max(1, len(sample))
+    return (len(sample) / (1.0 + repeated * 0.02 + low * 2.0 + runs * 4.0)) * size_penalty
 
 
 def rank(src: bytes, *, include_direct: bool = True) -> list[Candidate]:
-    """Build and rank all universal representations without DE2 trials."""
+    """Build all universal representations without running DE2."""
     src = bytes(src)
     kinds = list(Kind)
     if not include_direct:
         kinds.remove(Kind.DIRECT)
-    result = []
-    for kind in kinds:
-        payload = transform(src, kind)
-        result.append(Candidate(kind, payload, _score(payload)))
+    result = [Candidate(kind, transform(src, kind), 0.0) for kind in kinds]
+    result = [Candidate(c.kind, c.payload, _score(c.payload)) for c in result]
     result.sort(key=lambda c: (c.score, int(c.kind), len(c.payload)))
     return result
 
 
 def best(src: bytes) -> Candidate:
-    """Return the cheapest-proxy universal representation."""
     return rank(src)[0]
 
 
 def verify(src: bytes, kind: Kind) -> bytes:
-    """Transform and inverse-transform, raising if byte-exactness is lost."""
     transformed = transform(src, kind)
-    restored = inverse(transformed, kind)
+    restored = inverse(transformed, kind, original_size=len(src))
     if restored != bytes(src):
         raise AssertionError(f"UBIR roundtrip failed for {kind.name}")
     return transformed
