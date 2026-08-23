@@ -6,8 +6,10 @@ escaped as (0xFF, 0).  The dictionary is stored in block metadata, so the
 candidate is always self-contained and lossless.
 
 This is an IR, not a second compressor: DE2/LZ still does the actual entropy
-coding after the transform.  The encoder is allowed to reject the IR when it
-does not reduce the final DE2 block size.
+coding after the transform.  Importantly, the IR is allowed to grow the
+intermediate representation; only the final DE2 block is compared with the
+direct representation.  This lets a deliberately redundant IR expose
+structure that the byte-oriented LZ parser could not see directly.
 """
 from collections import Counter
 
@@ -55,7 +57,9 @@ def _mine(data: bytes, k: int, max_dict: int) -> list[bytes]:
 
 def encode(data: bytes, phrase_len: int = DEFAULT_PHRASE_LEN,
            max_dict: int = DEFAULT_MAX_DICT):
-    """Return (phrase-IR bytes, metadata), or (None, b"") if not useful."""
+    """Return (phrase-IR bytes, metadata), or (None, b"") if no useful
+    repeated phrases exist.
+    """
     src = bytes(data)
     if phrase_len < 3 or phrase_len > 32:
         raise ValueError("phrase_len must be in [3, 32]")
@@ -87,17 +91,16 @@ def encode(data: bytes, phrase_len: int = DEFAULT_PHRASE_LEN,
             out.append(b)
         i += 1
 
-    # Metadata is part of the DE2 block and therefore participates in the
-    # final size comparison.  Reject the IR before LZ if its representation
-    # plus dictionary is already not smaller than the source.
+    # Metadata carries the exact transformed length because the LZ decoder
+    # must know the post-IR size before phrase expansion.  No representation
+    # size gate is applied here: a larger IR can still yield a smaller final
+    # DE2 block, which is the entire purpose of this preconditioner.
     meta = bytearray(MAGIC)
     meta.append(phrase_len)
     meta += encode_varint(len(dictionary))
     for p in dictionary:
         meta += p
     meta += encode_varint(len(out))
-    if len(out) + len(meta) >= len(src):
-        return None, b""
     return bytes(out), bytes(meta)
 
 
