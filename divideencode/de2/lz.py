@@ -304,45 +304,94 @@ def decode(blob, pos, end, raw_len, tables):
     lit_count, pos = _rv(blob, pos, end)
     literals, pos = entropy.decode_stream(blob, pos, end, lit_count, tables)
 
-    lls = []
-    mls = []
-    ds = []
-    ap_ll = lls.append
-    ap_ml = mls.append
-    ap_d = ds.append
-    slen, pos = _rv(blob, pos, end)
-    sblob, pos = entropy.decode_stream(blob, pos, end, slen, tables)
-    p = 0
-    for _ in range(num_matches):
-        v, p = _rv(sblob, p, slen)
-        ap_ll(v)
-    slen, pos = _rv(blob, pos, end)
-    sblob, pos = entropy.decode_stream(blob, pos, end, slen, tables)
-    p = 0
-    for _ in range(num_matches):
-        v, p = _rv(sblob, p, slen)
-        ap_ml(v)
-    slen, pos = _rv(blob, pos, end)
-    sblob, pos = entropy.decode_stream(blob, pos, end, slen, tables)
-    p = 0
-    for _ in range(num_matches):
-        v, p = _rv(sblob, p, slen)
-        ap_d(v)
+    ll_buf, ml_buf, d_buf = None, None, None
+    for target in range(3):
+        slen, pos = _rv(blob, pos, end)
+        sblob, pos = entropy.decode_stream(blob, pos, end, slen, tables)
+        if target == 0:
+            ll_buf = sblob
+            ll_end = slen
+        elif target == 1:
+            ml_buf = sblob
+            ml_end = slen
+        else:
+            d_buf = sblob
+            d_end = slen
     if pos != end:
         raise CorruptedError("lz frame has excess data")
 
     out = bytearray()
     r0, r1, r2, r3 = 1, 2, 4, 8
     li = 0
-    for t in range(num_matches):
-        ll = lls[t]
+    p_ll = p_ml = p_d = 0
+    for _ in range(num_matches):
+        # ---- inline varints (single-byte fast path) ----
+        if p_ll < ll_end:
+            v = ll_buf[p_ll]
+            p_ll += 1
+            if v > 127:
+                v &= 127
+                shift = 7
+                while True:
+                    if p_ll >= ll_end:
+                        raise CorruptedError("truncated varint")
+                    b = ll_buf[p_ll]
+                    p_ll += 1
+                    v |= (b & 127) << shift
+                    if b < 128:
+                        break
+                    shift += 7
+                    if shift > 56:
+                        raise CorruptedError("varint overflow")
+            ll = v
+        else:
+            raise CorruptedError("truncated literal-length stream")
+        if p_ml < ml_end:
+            v = ml_buf[p_ml]
+            p_ml += 1
+            if v > 127:
+                v &= 127
+                shift = 7
+                while True:
+                    if p_ml >= ml_end:
+                        raise CorruptedError("truncated varint")
+                    b = ml_buf[p_ml]
+                    p_ml += 1
+                    v |= (b & 127) << shift
+                    if b < 128:
+                        break
+                    shift += 7
+                    if shift > 56:
+                        raise CorruptedError("varint overflow")
+            ml = v + MIN_MATCH
+        else:
+            raise CorruptedError("truncated match-length stream")
+        if p_d < d_end:
+            e = d_buf[p_d]
+            p_d += 1
+            if e > 127:
+                e &= 127
+                shift = 7
+                while True:
+                    if p_d >= d_end:
+                        raise CorruptedError("truncated varint")
+                    b = d_buf[p_d]
+                    p_d += 1
+                    e |= (b & 127) << shift
+                    if b < 128:
+                        break
+                    shift += 7
+                    if shift > 56:
+                        raise CorruptedError("varint overflow")
+        else:
+            raise CorruptedError("truncated distance stream")
+
+        # ---- execute token ----
         if ll:
             if li + ll > lit_count:
                 raise CorruptedError("lz literal run exceeds pool")
             out += literals[li:li + ll]
             li += ll
-        ml = mls[t] + MIN_MATCH
-        e = ds[t]
         olen = len(out)
         if e <= 3:
             if e == 0:
@@ -369,14 +418,19 @@ def decode(blob, pos, end, raw_len, tables):
         if d >= ml:
             out += out[src:src + ml]
         else:
-            while ml > 0:
+            # overlap-safe exponential copy: O(log ml) appends
+            while True:
                 chunk = d if d < ml else ml
-                base = len(out) - d
-                out += out[base:base + chunk]
+                out += out[len(out) - d:len(out) - d + chunk]
                 ml -= chunk
+                if ml <= 0:
+                    break
+                d += d
 
     if li > lit_count:
         raise CorruptedError("lz literal pool not fully consumed")
+    if p_ll != ll_end or p_ml != ml_end or p_d != d_end:
+        raise CorruptedError("lz stream has unconsumed bytes")
     out += literals[li:]
     if len(out) != raw_len:
         raise CorruptedError("lz produced wrong block size")

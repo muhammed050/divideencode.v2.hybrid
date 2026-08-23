@@ -21,6 +21,8 @@ from ..errors import CorruptedError
 
 MAX_CODE_LEN = 15
 
+_MASKS = [(1 << k) - 1 for k in range(130)]
+
 
 # ------------------------------------------------------------- varints ----
 
@@ -240,16 +242,25 @@ def decode_stream(blob, pos, end, expected_len, tables):
 
     out = bytearray()
     append = out.append
+    masks = _MASKS
+    ifb = int.from_bytes
     acc = 0
     nbits = 0
     p = pos
     remaining = expected_len
     consumed = 0
     while remaining:
-        while nbits < maxlen and p < data_end:
-            acc = (acc << 8) | blob[p]
-            p += 1
-            nbits += 8
+        # refill: prefer 4-byte big-endian loads, fall back per byte
+        if nbits < 25:
+            if data_end - p >= 4:
+                acc = ((acc << 32) | ifb(blob[p:p + 4], "big")) & 0xFFFFFFFFFFFFFFFF
+                p += 4
+                nbits += 32
+            else:
+                while nbits < maxlen and p < data_end:
+                    acc = (acc << 8) | blob[p]
+                    p += 1
+                    nbits += 8
         if nbits >= maxlen:
             idx = (acc >> (nbits - maxlen)) & mask
         else:
@@ -264,7 +275,7 @@ def decode_stream(blob, pos, end, expected_len, tables):
         append(sym)
         remaining -= 1
         nbits -= l
-        acc &= (1 << nbits) - 1
+        acc &= masks[nbits]
     if limit_bits - consumed >= 8:
         raise CorruptedError("excess data after huffman stream")
     return bytes(out), data_end
