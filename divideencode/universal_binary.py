@@ -1,9 +1,10 @@
-"""UBIR2 -- fast universal binary representation search for DE2.
+"""UBIR2 -- guided universal binary representation search for DE2.
 
 The IR is intentionally allowed to grow. The only objective is the final
-DE2 container size. A cheap sample pass ranks reversible transforms, then
-only the most promising transforms are materialized and sent through DE2.
-DIRECT is always encoded as the baseline and is always eligible to win.
+DE2 container size. A cheap proxy narrows the search, then a bounded sample
+is actually compressed by DE2 to choose the most promising representation.
+Only the selected full-size representation is sent through DE2, alongside
+DIRECT as the mandatory baseline.
 
 This module is deliberately separate from the existing phrase frontend so
 benchmarks can compare the approaches without changing DE2 internals.
@@ -128,7 +129,7 @@ def analyze(data: bytes, *, sample_size: int = 256 * 1024) -> Analysis:
 
 
 def _proxy(data: bytes) -> float:
-    """Cheap lower-is-better proxy used only on the bounded sample."""
+    """Cheap lower-is-better proxy used only for initial candidate pruning."""
     if not data:
         return 0.0
     sample = data[: min(len(data), 64 * 1024)]
@@ -141,37 +142,66 @@ def _proxy(data: bytes) -> float:
     return 1.0 / (1.0 + concentration * 0.015 + zeros * 2.5 + runs * 4.0)
 
 
-def _sample_transform(data: bytes, kind: Kind) -> bytes:
-    return transform(data, kind)
-
-
-def rank_candidates(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED) -> list[Kind]:
-    """Return only likely DE2-friendly transforms, without running DE2."""
-    mode = _normalize_mode(mode)
-    sample = bytes(data[: 256 * 1024])
+def _candidate_pool(data: bytes, mode: SearchMode) -> list[Kind]:
+    """Use cheap statistics to make a small pool for the DE2 sample oracle."""
+    sample = bytes(data[:256 * 1024])
     if not sample:
-        return [Kind.DIRECT]
+        return []
     candidates = [Kind.DELTA8, Kind.XOR8, Kind.BITPLANE, Kind.TRANSPOSE4, Kind.TRANSPOSE8]
-    # Nibble planes always double the IR and are therefore only explored when
-    # the sample strongly concentrates in low/high nibbles.
     low_nibble = sum((b & 0x0F) == 0 for b in sample) / len(sample)
     high_nibble = sum((b >> 4) == 0 for b in sample) / len(sample)
     if max(low_nibble, high_nibble) >= 0.20:
         candidates.append(Kind.NIBBLE)
 
-    base_proxy = _proxy(sample)
+    base = _proxy(sample)
     scored: list[tuple[float, Kind]] = []
     for kind in candidates:
-        transformed = _sample_transform(sample, kind)
-        growth = len(transformed) / len(sample)
-        score = _proxy(transformed) * growth
-        # Require a meaningful predicted improvement. This keeps random and
-        # already-compressed data on DIRECT without expensive full trials.
-        if score < base_proxy * 0.94:
+        transformed = transform(sample, kind)
+        score = _proxy(transformed) * (len(transformed) / len(sample))
+        if score < base * 0.99:
             scored.append((score, kind))
     scored.sort(key=lambda x: (x[0], int(x[1])))
-    limit = {SearchMode.FAST: 1, SearchMode.BALANCED: 2, SearchMode.MAX: 3}[mode]
-    return [Kind.DIRECT] + [kind for _score, kind in scored[:limit]]
+
+    # The proxy only selects a bounded pool. The final decision is made by
+    # actual DE2 on the sample, never by this heuristic alone.
+    pool_limit = {SearchMode.FAST: 1, SearchMode.BALANCED: 2, SearchMode.MAX: 3}[mode]
+    return [kind for _score, kind in scored[:pool_limit]]
+
+
+def _guided_candidates(data: bytes, mode: SearchMode, *, sample_size: int = 64 * 1024) -> list[Kind]:
+    """Pick transforms using real DE2 sizes on a bounded sample."""
+    from .de2 import compress as de2_compress
+
+    pool = _candidate_pool(data, mode)
+    if not pool:
+        return []
+    sample = bytes(data[:sample_size])
+    direct_size = len(de2_compress(sample, level="BALANCED"))
+    scored: list[tuple[int, Kind]] = []
+    for kind in pool:
+        transformed = transform(sample, kind)
+        size = len(de2_compress(transformed, level="BALANCED"))
+        # Only candidates that beat DIRECT on the actual sample survive.
+        if size < direct_size:
+            scored.append((size, kind))
+    scored.sort(key=lambda x: (x[0], int(x[1])))
+    if not scored:
+        return []
+
+    # Balanced/Max may retain a second candidate only when it is genuinely
+    # close to the best sample result. This prevents expensive full trials on
+    # weak alternatives while preserving diversity.
+    best_size = scored[0][0]
+    if mode == SearchMode.FAST:
+        return [scored[0][1]]
+    close = [kind for size, kind in scored if size <= best_size * 1.02]
+    return close[:2 if mode == SearchMode.BALANCED else 3]
+
+
+def rank_candidates(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED) -> list[Kind]:
+    """Return DIRECT plus transforms selected by a bounded DE2 sample oracle."""
+    mode = _normalize_mode(mode)
+    return [Kind.DIRECT] + _guided_candidates(bytes(data), mode)
 
 
 def _pack(kind: Kind, original_size: int, crc: int, payload: bytes) -> bytes:
@@ -197,11 +227,7 @@ def _unpack(blob: bytes) -> tuple[Kind, int, int, bytes]:
 
 
 def compress(data: bytes, *, mode: SearchMode | str = SearchMode.BALANCED, level: str = "BALANCED", block_size: int = 1 << 20) -> bytes:
-    """Compress using DIRECT plus at most 1/2/3 promising UBIR transforms.
-
-    The final winner is always selected by the actual DE2 byte length. The
-    representation itself is never required to be smaller than the source.
-    """
+    """Compress with DIRECT plus only transforms proven by sample DE2."""
     from .de2 import compress as de2_compress
 
     src = bytes(data)
