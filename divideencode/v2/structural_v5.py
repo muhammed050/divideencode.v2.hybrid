@@ -122,9 +122,6 @@ def _decode_step(s):
                 prev = out[p]
         return bytes(out)
 
-    # STEP_V4 stores a complete v4 stream in its payload.  During composed
-    # decoding the caller supplies the current payload here, so decode that
-    # current value rather than the stale Step.payload object.
     if s.kind == STEP_V4:
         return v4.inverse(s.payload)
 
@@ -241,12 +238,44 @@ def transform(data, max_depth=3):
 
 
 def adaptive_transform(data, scorer, max_depth=3):
+    """Choose the smallest downstream-scored representation without regressions.
+
+    The scorer may reject candidates by raising.  Rejections are ignored rather
+    than converted into a numeric score.  The final selected blob is rescored
+    once before returning, so the Decision's downstream_size always describes
+    the blob that is actually returned.
+    """
     raw = _raw(data)
+    try:
+        best = scorer(data)
+    except Exception:
+        return Decision((), raw, len(raw), None)
+
     best_blob = raw
     best_kinds = ()
-    best = scorer(data)
+
     for c in analyze(data, max_depth):
-        score = scorer(c.blob)
+        try:
+            score = scorer(c.blob)
+        except Exception:
+            continue
         if score < best:
             best, best_blob, best_kinds = score, c.blob, c.kinds
+
+    # Defensive consistency check: scorer implementations can be stateful or
+    # use codec paths that reject a transformed representation. Never return a
+    # stale score that does not belong to the selected blob.
+    try:
+        selected_score = scorer(best_blob)
+    except Exception:
+        selected_score = None
+
+    if selected_score is None or selected_score > best:
+        best_blob = raw
+        best_kinds = ()
+        try:
+            best = scorer(data)
+        except Exception:
+            best = None
+
     return Decision(best_kinds, best_blob, len(best_blob), best)
