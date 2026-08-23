@@ -42,10 +42,11 @@ def classify(fs):
             (fs.big_run and fs.run_bytes_frac >= _RLE_BIG_RUN_FRAC):
         return MODE_RLE, None
 
-    # numeric / sequential: strong word monotonicity, or a large entropy
-    # drop in the hi-byte plane of the u16 zigzag-delta (sensor-style)
-    if fs.mono32 >= _MONO32 or (fs.delta_ratio >= _DELTA_GAIN
-                                and fs.printable_frac < 0.85):
+    # Numeric / sequential detection must not steal ordinary printable text.
+    # Repeating prose can look monotonic when interpreted as little-endian
+    # u32 words, so only use mono32 as a numeric signal for non-text blocks.
+    if (fs.mono32 >= _MONO32 and fs.printable_frac < 0.85) or \
+            (fs.delta_ratio >= _DELTA_GAIN and fs.printable_frac < 0.85):
         return MODE_DELTA_LZ, None
 
     # incompressible: high entropy, no repetition -> RAW immediately
