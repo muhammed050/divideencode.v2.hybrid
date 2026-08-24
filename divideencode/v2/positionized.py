@@ -1,11 +1,12 @@
-"""DE2 positionized transform with cheap positional patternization.
+"""DE2 positionized transform with compact symbol-position encoding.
 
-For every byte value we store one symbol ID and describe its positions using
-small numeric patterns before passing the resulting stream to DE2.  Patterns
-are intentionally cheap: arithmetic runs (START, STEP, COUNT) and constant
-runs (START, COUNT).  Anything not matching a useful pattern remains a
-varint gap stream.  The complete transform is lossless and automatically
-falls back to direct DE2 when the positional representation is larger.
+Each distinct byte gets a small dictionary ID implicitly (dictionary order),
+and its occurrences are represented as numeric position patterns.  The
+position stream is deliberately numeric: absolute first position + gap-1
+varints, with cheap arithmetic/run records where they win.
+
+The transform remains lossless and automatically falls back to ordinary DE2
+when positionization is not smaller.
 """
 from __future__ import annotations
 
@@ -13,12 +14,12 @@ import struct
 from .codec import compress as de2_compress, decompress as de2_decompress
 
 MAGIC = b"DE2P"
-VERSION = 3
+VERSION = 4
 
-# Record tags inside the positional stream.
-RAW = 0
-ARITH = 1
-RUN = 2
+# Compact record tags.
+GAPS = 0       # first absolute position, then gap-1 values
+ARITH = 1      # start, signed step, count
+RUN = 2        # start, count (step=1)
 
 
 def _uvarint(n: int) -> bytes:
@@ -48,7 +49,6 @@ def _read_uvarint(buf: bytes, off: int):
 
 
 def _svarint(n: int) -> bytes:
-    # ZigZag, so small negative steps are cheap too.
     return _uvarint((n << 1) ^ (n >> 63))
 
 
@@ -64,28 +64,24 @@ def _build_positions(data: bytes):
 
     dictionary = bytearray()
     stream = bytearray()
-
     for symbol, poslist in enumerate(positions):
-        if not poslist:
-            continue
-        dictionary.append(symbol)
-        stream += _encode_position_list(poslist)
-
+        if poslist:
+            dictionary.append(symbol)
+            stream += _encode_position_list(poslist)
     return bytes(dictionary), bytes(stream)
 
 
 def _encode_position_list(poslist: list[int]) -> bytes:
-    """Encode one symbol's positions with cheap pattern records."""
-    out = bytearray()
-    i = 0
+    """Compactly encode one symbol's ordered positions."""
     n = len(poslist)
+    out = bytearray(_uvarint(n))
+    i = 0
 
-    # A list is split into records. Four terms are enough to justify the
-    # pattern header; otherwise raw gaps are cheaper and DE2 handles them.
     while i < n:
         remaining = n - i
+        start = poslist[i]
+
         if remaining >= 4:
-            start = poslist[i]
             step = poslist[i + 1] - start
             j = i + 2
             while j < n and poslist[j] - poslist[j - 1] == step:
@@ -104,25 +100,28 @@ def _encode_position_list(poslist: list[int]) -> bytes:
                 i = j
                 continue
 
-        # Raw record: encode a short run of absolute positions as deltas.
+        # GAPS record.  gap-1 makes the most common gap=1 become zero.
+        # Eight positions keeps the record overhead bounded while still
+        # giving DE2 a long numeric stream to exploit.
         take = min(8, remaining)
-        out.append(RAW)
+        out.append(GAPS)
         out += _uvarint(take)
-        prev = 0
-        for k in range(take):
-            p = poslist[i + k]
-            if k == 0:
-                out += _uvarint(p)
-            else:
-                out += _uvarint(p - prev)
-            prev = p
+        out += _uvarint(start)
+        prev = start
+        for k in range(1, take):
+            gap = poslist[i + k] - prev
+            if gap <= 0:
+                raise ValueError("positions must be strictly increasing")
+            out += _uvarint(gap - 1)
+            prev = poslist[i + k]
         i += take
 
-    return _uvarint(n) + out
+    return bytes(out)
 
 
 def _restore_positions(dictionary: bytes, stream: bytes, original_len: int) -> bytes:
     out = bytearray(original_len)
+    occupied = bytearray(original_len)
     off = 0
     used = 0
 
@@ -134,12 +133,19 @@ def _restore_positions(dictionary: bytes, stream: bytes, original_len: int) -> b
                 raise ValueError("truncated positional records")
             tag = stream[off]
             off += 1
-            if tag == RUN:
+
+            if tag == GAPS:
+                take, off = _read_uvarint(stream, off)
+                if take == 0:
+                    raise ValueError("empty gaps record")
                 start, off = _read_uvarint(stream, off)
-                run_count, off = _read_uvarint(stream, off)
-                if run_count == 0:
-                    raise ValueError("empty run")
-                positions.extend(range(start, start + run_count))
+                positions.append(start)
+                prev = start
+                for _ in range(1, take):
+                    gap_minus_1, off = _read_uvarint(stream, off)
+                    prev += gap_minus_1 + 1
+                    positions.append(prev)
+
             elif tag == ARITH:
                 start, off = _read_uvarint(stream, off)
                 step, off = _read_svarint(stream, off)
@@ -147,16 +153,14 @@ def _restore_positions(dictionary: bytes, stream: bytes, original_len: int) -> b
                 if run_count == 0:
                     raise ValueError("empty arithmetic run")
                 positions.extend(start + step * k for k in range(run_count))
-            elif tag == RAW:
-                take, off = _read_uvarint(stream, off)
-                if take == 0:
-                    raise ValueError("empty raw record")
-                prev = 0
-                for k in range(take):
-                    delta, off = _read_uvarint(stream, off)
-                    p = delta if k == 0 else prev + delta
-                    positions.append(p)
-                    prev = p
+
+            elif tag == RUN:
+                start, off = _read_uvarint(stream, off)
+                run_count, off = _read_uvarint(stream, off)
+                if run_count == 0:
+                    raise ValueError("empty run")
+                positions.extend(range(start, start + run_count))
+
             else:
                 raise ValueError("unknown positional record")
 
@@ -164,11 +168,9 @@ def _restore_positions(dictionary: bytes, stream: bytes, original_len: int) -> b
                 raise ValueError("positional record exceeds symbol count")
 
         for p in positions:
-            if p >= original_len:
-                raise ValueError("position outside original stream")
-            if out[p] != 0:
-                # Symbol zero is valid, so use a separate occupancy check.
-                pass
+            if p >= original_len or occupied[p]:
+                raise ValueError("invalid or duplicate position")
+            occupied[p] = 1
             out[p] = symbol
         used += len(positions)
 
@@ -190,12 +192,14 @@ def compress(data: bytes) -> bytes:
     dictionary, positions = _build_positions(raw)
     packed = de2_compress(positions)
 
-    # H is required because all 256 byte values can occur.
     candidate = (
         MAGIC + bytes((VERSION,)) +
         struct.pack("<HI", len(dictionary), len(raw)) +
         dictionary + packed
     )
+
+    # Direct DE2 remains the safety net. Positionization is never allowed
+    # to make an input larger than the best existing DE2 representation.
     direct = de2_compress(raw)
     fallback = MAGIC + b"\x00" + struct.pack("<I", len(raw)) + direct
     return candidate if len(candidate) < len(fallback) else fallback
