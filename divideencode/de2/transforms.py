@@ -1,27 +1,4 @@
-"""DE2 reversible transforms (M3/M4).
-
-Every transform returns (payload_bytes, tmeta_bytes) where tmeta carries
-an explicit reversal recipe consumed verbatim by the decoder. Unknown
-tmeta shapes are hard errors in the decoder.
-
-tmeta grammar:
-    b"D" + wcode + zzflag              word zigzag-delta, width WORD_SIZES[wcode]
-    b"C" + wcode + zzflag + scode      that delta, then a byte-plane
-                                       de-interleave of width WORD_SIZES[scode]
-
-DELTA: words of width w (little-endian); first word stored as-is, each
-following entry is the modular difference against its predecessor,
-zigzag-mapped so small signed movements stay small. Trailing bytes
-(len % w) are appended verbatim.
-
-PLANE SPLIT: de-interleave into sw byte-planes concatenated in order;
-the decoder re-interleaves using the block's original length. Helps when
-low bytes carry entropy while high bytes are near-constant.
-
-`numeric_encode` evaluates a small bounded candidate set (three delta
-widths plus at most one split variant) and keeps the smallest LZ frame --
-deterministic, no search explosion.
-"""
+"""DE2 reversible transforms (M3/M4)."""
 import array
 import sys
 
@@ -66,11 +43,12 @@ def _delta_core(data, w, zigzag):
         prev = int(vals[0])
         out += prev.to_bytes(w, "little")
         half = 1 << (8 * w - 1)
+        full = 1 << (8 * w)
         for j in range(1, nw):
             x = int(vals[j])
             d = (x - prev) & mask
             if zigzag:
-                sd = d - (1 << (8 * w)) if d >= half else d
+                sd = d - full if d >= half else d
                 d = ((sd << 1) ^ (sd >> (8 * w))) & mask
             out += d.to_bytes(w, "little")
             prev = x
@@ -114,62 +92,65 @@ def _plane_join(data, sw, orig_len):
 
 
 def delta_encode(data, w=4, zigzag=True):
-    """Simple single-stage form -> (transformed bytes, tmeta)."""
     if w not in WORD_SIZES:
         raise ValueError("invalid delta word width %r" % (w,))
-    return _delta_core(data, w, zigzag), \
-        b"D" + bytes((WORD_SIZES.index(w), 1 if zigzag else 0))
+    return _delta_core(data, w, zigzag), b"D" + bytes((WORD_SIZES.index(w), 1 if zigzag else 0))
 
 
 def numeric_encode(data, mono=None, hi_gain=None, _enc=None):
-    """Bounded multi-candidate numeric pre-transform (M4/M5).
+    """Bounded numeric search with cheap LZ screening.
 
-    Tries zigzag-delta widths from a feature-ranked candidate order
-    (mono streams -> wide words first; hi-plane-collapse streams ->
-    byte width first), keeping the smallest LZ frame; appends a
-    same-width plane-split attempt for widths >= 2. An early-accept
-    rule stops as soon as a frame lands under 2% of the input --
-    no realistic competitor beats that by enough to pay for another
-    encode. Returns (frame, tmeta).
-
-    _enc selects the LZ frame codec (defaults to the legacy v1 frame;
-    the container passes lz.encode_v2 so payload frames match the
-    container's FLAG_LZ_V2 contract).
+    Candidate transforms are first ranked using FAST LZ. Only the best
+    transform is then encoded with the caller's real codec/level. This
+    keeps the BALANCED/MAX output quality while removing most expensive
+    repeated deep LZ searches from the candidate-selection phase.
     """
     if _enc is None:
         _enc = lz.encode
-    if hi_gain is not None and hi_gain >= 2.0:
-        order = (1, 4, 2)     # byte-delta exposes LCG-style structure
-    elif mono is not None and mono >= 0.85:
-        order = (4, 2, 1)     # monotonic counters: wide words win
-    else:
-        order = (2, 4, 1)     # smooth signals: u16 zigzag + split
 
-    n = len(data)
-    accept_at = max(64, n // 50)
-    best_frame = None
-    best_tmeta = None
-    best_w = None
+    if hi_gain is not None and hi_gain >= 2.0:
+        order = (1, 4, 2)
+    elif mono is not None and mono >= 0.85:
+        order = (4, 2, 1)
+    else:
+        order = (2, 4, 1)
+
+    candidates = []
     for w in order:
-        frame = _enc(_delta_core(data, w, True))
-        if best_frame is None or len(frame) < len(best_frame):
-            best_frame = frame
-            best_tmeta = b"D" + bytes((WORD_SIZES.index(w), 1))
-            best_w = w
-        if len(best_frame) <= accept_at:
-            return best_frame, best_tmeta
+        transformed = _delta_core(data, w, True)
+        # Screening is deliberately FAST. The actual winner is re-encoded
+        # below with the original codec so BALANCED/MAX quality is retained.
+        try:
+            screened = lz.encode_v2(transformed, level="FAST")
+        except AttributeError:
+            screened = lz.encode(transformed, level="FAST")
+        candidates.append((len(screened), w, transformed))
+
+    candidates.sort(key=lambda x: x[0])
+    _, best_w, best_transformed = candidates[0]
+    best_frame = _enc(best_transformed)
+    best_tmeta = b"D" + bytes((WORD_SIZES.index(best_w), 1))
+
+    # Only test the plane split when the FAST screen says it has a realistic
+    # chance to beat the selected delta. This is a cheap transform, while a
+    # second full DE2/LZ encode is not.
     if best_w >= 2:
-        transformed = _delta_core(data, best_w, True)
-        frame = _enc(_plane_split(transformed, best_w))
-        if len(frame) < len(best_frame):
-            best_frame = frame
-            best_tmeta = b"C" + bytes((WORD_SIZES.index(best_w), 1,
-                                       WORD_SIZES.index(best_w)))
+        split = _plane_split(best_transformed, best_w)
+        try:
+            split_screen = lz.encode_v2(split, level="FAST")
+        except AttributeError:
+            split_screen = lz.encode(split, level="FAST")
+        if len(split_screen) < len(best_frame):
+            frame = _enc(split)
+            if len(frame) < len(best_frame):
+                best_frame = frame
+                best_tmeta = b"C" + bytes((WORD_SIZES.index(best_w), 1,
+                                           WORD_SIZES.index(best_w)))
+
     return best_frame, best_tmeta
 
 
 def transform_decode(payload, tmeta, orig_len):
-    """Inverse of any tmeta produced by delta_encode/numeric_encode."""
     if not tmeta:
         raise CorruptedError("missing transform metadata")
     kind = tmeta[0:1]
@@ -192,11 +173,4 @@ def transform_decode(payload, tmeta, orig_len):
 
 
 def delta_decode(payload, tmeta):
-    """Backwards-compatible single-stage inverse."""
     return transform_decode(payload, tmeta, len(payload))
-
-
-# STRUCT+LZ: benchmark evidence (2026-08-22) showed dictionary substitution
-# plus LZ loses to plain LZ on 5/6 structured corpus files because phrase
-# metadata outweighs the gain; the engine therefore maps STRUCT+LZ blocks
-# to plain LZ (still lossless).
