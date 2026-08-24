@@ -1,10 +1,9 @@
 """DE3: fast run-based numeric-factor transform.
 
-DE3 looks for adjacent decimal integer runs separated by common delimiters.
-Instead of inspecting the whole file, it performs one linear scan. A run is
-encoded only when the compact integer representation is smaller than its
-original spelling. Delimiters and every untouched byte are preserved exactly.
-The output is then fed to DE2 by the benchmark/codec layer.
+One linear scan finds adjacent decimal integer runs separated by common
+ delimiters. A run is encoded only when the compact factor+delta representation
+is smaller than its original spelling. Untouched bytes and delimiters remain
+byte-exact. The transformed stream is intended to be compressed by DE2.
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ _DELIMS = b" \t,;|\r\n"
 
 
 def _put_varint(n: int) -> bytes:
-    # Unsigned LEB128.
     out = bytearray()
     while n >= 0x80:
         out.append((n & 0x7F) | 0x80)
@@ -44,7 +42,7 @@ def _zigzag(n: int) -> int:
 
 
 def _unzigzag(n: int) -> int:
-    return (n >> 1) if (n & 1) == 0 else -((n >> 1) + 1)
+    return (n >> 1) if not (n & 1) else -((n >> 1) + 1)
 
 
 def _factor10(v: int) -> tuple[int, int]:
@@ -66,20 +64,21 @@ def _number_end(data: bytes, start: int) -> int:
     return i
 
 
-def _parse_run(data: bytes, start: int) -> tuple[int, list[tuple[int, int, int]]] | None:
-    """Return (end, [(num_start,num_end,value), ...]) for a numeric run."""
+def _valid_number(data: bytes, a: int, b: int) -> bool:
+    if b <= a or (data[a] in (43, 45) and b == a + 1):
+        return False
+    digits = data[a:b].lstrip(b"+-")
+    return not (len(digits) > 1 and digits.startswith(b"0"))
+
+
+def _parse_run(data: bytes, start: int):
     n = len(data)
     if start >= n or not (48 <= data[start] <= 57 or data[start] in (43, 45)):
         return None
-    a = start
-    b = _number_end(data, a)
-    if b <= a or (data[a] in (43, 45) and b == a + 1):
+    b = _number_end(data, start)
+    if not _valid_number(data, start, b):
         return None
-    # Preserve leading-zero spellings; they are not safe to canonicalize.
-    token = data[a:b]
-    if token.lstrip(b"+-").startswith(b"0") and len(token.lstrip(b"+-")) > 1:
-        return None
-    vals = [(a, b, int(token))]
+    vals = [(start, b, int(data[start:b]))]
     p = b
     while p < n and data[p] in _DELIMS:
         q = p
@@ -88,25 +87,17 @@ def _parse_run(data: bytes, start: int) -> tuple[int, list[tuple[int, int, int]]
         if q >= n or not (48 <= data[q] <= 57 or data[q] in (43, 45)):
             break
         e = _number_end(data, q)
-        if e <= q or (data[q] in (43, 45) and e == q + 1):
+        if not _valid_number(data, q, e):
             break
-        tok = data[q:e]
-        digits = tok.lstrip(b"+-")
-        if digits.startswith(b"0") and len(digits) > 1:
-            break
-        vals.append((q, e, int(tok)))
+        vals.append((q, e, int(data[q:e])))
         p = e
-    if len(vals) < 2:
-        return None
-    return p, vals
+    return (p, vals) if len(vals) >= 2 else None
 
 
-def _encode_run(data: bytes, start: int, end: int, vals: list[tuple[int, int, int]]) -> bytes | None:
+def _encode_run(data: bytes, start: int, end: int, vals) -> bytes | None:
     numbers = [v for _, _, v in vals]
-    # A shared decimal factor: divide the entire run by the largest power of
-    # ten common to every value. This is the cheap "1000 -> 100 -> 10 -> 1"
-    # idea, generalized to a whole numeric run.
-    common = min(_factor10(abs(v))[1] for v in numbers if v != 0) if any(numbers) else 0
+    nonzero = [abs(v) for v in numbers if v]
+    common = min(_factor10(v)[1] for v in nonzero) if nonzero else 0
     scaled = [v // (10 ** common) for v in numbers]
     deltas = [scaled[0]] + [scaled[i] - scaled[i - 1] for i in range(1, len(scaled))]
 
@@ -115,18 +106,13 @@ def _encode_run(data: bytes, start: int, end: int, vals: list[tuple[int, int, in
     for d in deltas:
         payload += _put_varint(_zigzag(d))
 
-    # Store original delimiters so inverse is byte-exact.
     for i in range(len(vals) - 1):
-        s = vals[i][1]
-        e = vals[i + 1][0]
+        s, e = vals[i][1], vals[i + 1][0]
         payload += _put_varint(e - s)
         payload += data[s:e]
 
-    # Header: tag + original byte span + payload length. Only use if useful.
     record = bytes((1,)) + struct.pack("<I", end - start) + _put_varint(len(payload)) + payload
-    if len(record) >= end - start + 1:
-        return None
-    return record
+    return record if len(record) < end - start + 1 else None
 
 
 def transform(data: bytes) -> bytes:
@@ -144,12 +130,11 @@ def transform(data: bytes) -> bytes:
                 out += record
                 i = end
                 continue
-        # Literal block. Runs of literals are emitted as one block to reduce
-        # DE3's framing overhead dramatically on ordinary text/binary data.
+
+        # Jump directly to the next possible numeric start instead of calling
+        # the parser at every byte. This keeps DE3 linear on incompressible data.
         j = i + 1
-        while j < n:
-            if _parse_run(data, j) is not None:
-                break
+        while j < n and not (48 <= data[j] <= 57 or data[j] in (43, 45)):
             j += 1
         out.append(0)
         out += _put_varint(j - i)
@@ -180,10 +165,9 @@ def inverse(data: bytes) -> bytes:
             out += data[i:i + length]
             i += length
             continue
-        if tag != 1:
-            raise ValueError(f"unknown DE3 tag {tag}")
-        if i + 4 > len(data):
-            raise ValueError("truncated DE3 run header")
+        if tag != 1 or i + 4 > len(data):
+            raise ValueError("invalid DE3 run")
+
         original_len = struct.unpack_from("<I", data, i)[0]
         i += 4
         plen, i = _get_varint(data, i)
@@ -195,6 +179,7 @@ def inverse(data: bytes) -> bytes:
         count, i = _get_varint(data, i)
         if count == 0:
             raise ValueError("empty DE3 run")
+
         scaled = []
         cur = 0
         for idx in range(count):
@@ -204,18 +189,17 @@ def inverse(data: bytes) -> bytes:
             scaled.append(cur)
         values = [v * (10 ** scale) for v in scaled]
         parts = [str(v).encode("ascii") for v in values]
+        run_start = len(out)
         for idx in range(count - 1):
             dl, i = _get_varint(data, i)
             if i + dl > end:
                 raise ValueError("invalid DE3 delimiter")
-            delim = data[i:i + dl]
+            out += parts[idx]
+            out += data[i:i + dl]
             i += dl
-            out += parts[idx] + delim
         out += parts[-1]
-        if i != end:
-            raise ValueError("unused DE3 run payload")
-        if sum(len(x) for x in parts) + (original_len - sum(v[1] - v[0] for v in [])) < 0:
-            raise ValueError("invalid DE3 run")
+        if i != end or len(out) - run_start != original_len:
+            raise ValueError("DE3 run length mismatch")
     raise ValueError("missing DE3 end marker")
 
 
