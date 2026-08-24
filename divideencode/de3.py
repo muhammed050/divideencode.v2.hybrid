@@ -1,12 +1,21 @@
-"""DE3: low-overhead numeric-factor preprocessor for DE2.
+"""DE3 numeric-factor preprocessor for DE2.
 
-Conservative by design: one linear scan, compact run records, one coalesced
-literal stream, and an exact raw fallback when no useful transform exists.
+DE3 is intentionally conservative: it does one linear scan, rewrites only
+integer runs that are provably smaller, and otherwise returns the original
+bytes so DE2 remains the authoritative compressor.
+
+The numeric representation is:
+    integer run -> common trailing-zero factor -> ZigZag delta stream
+
+The record format is compact and self-delimiting; no fixed 32-bit payload
+lengths are stored for every run. Signed integers are preserved exactly.
 """
 from __future__ import annotations
-import struct
 
-MAGIC = b"DE3R2"
+MAGIC = b"DE3R3"
+_LITERAL = 0
+_RUN = 1
+_END = 2
 _DELIMS = b" \t,;|\r\n"
 
 
@@ -52,7 +61,7 @@ def _factor10(v: int) -> int:
 
 def _number_end(data: bytes, start: int) -> int:
     i = start
-    if i < len(data) and data[i] in (43, 45):
+    if i < len(data) and data[i] == 45:  # '-'
         i += 1
     while i < len(data) and 48 <= data[i] <= 57:
         i += 1
@@ -60,15 +69,17 @@ def _number_end(data: bytes, start: int) -> int:
 
 
 def _valid_number(data: bytes, a: int, b: int) -> bool:
-    if b <= a or (data[a] in (43, 45) and b == a + 1):
+    if b <= a or data[a] == 43:  # '+' is rejected because reconstruction changes it
         return False
-    digits = data[a:b].lstrip(b"+-")
+    if data[a] == 45 and b == a + 1:
+        return False
+    digits = data[a:b].lstrip(b"-")
     return not (len(digits) > 1 and digits.startswith(b"0"))
 
 
 def _parse_run(data: bytes, start: int):
     n = len(data)
-    if start >= n or not (48 <= data[start] <= 57 or data[start] in (43, 45)):
+    if start >= n or not (48 <= data[start] <= 57 or data[start] == 45):
         return None
     b = _number_end(data, start)
     if not _valid_number(data, start, b):
@@ -79,32 +90,42 @@ def _parse_run(data: bytes, start: int):
         q = p
         while q < n and data[q] in _DELIMS:
             q += 1
-        if q >= n or not (48 <= data[q] <= 57 or data[q] in (43, 45)):
+        if q >= n or not (48 <= data[q] <= 57 or data[q] == 45):
             break
         e = _number_end(data, q)
         if not _valid_number(data, q, e):
             break
         vals.append((q, e, int(data[q:e])))
         p = e
-    return (p, vals) if len(vals) >= 2 else None
+    return (p, vals) if len(vals) >= 3 else None
 
 
 def _encode_run(data: bytes, start: int, end: int, vals) -> bytes | None:
     numbers = [v for _, _, v in vals]
-    common = min((_factor10(v) for v in numbers if v), default=0)
+    # Factoring is useful only when every non-zero value shares the factor.
+    scales = [_factor10(v) for v in numbers if v]
+    common = min(scales, default=0)
+    if common == 0:
+        return None
     divisor = 10 ** common
     scaled = [v // divisor for v in numbers]
     deltas = [scaled[0]] + [scaled[i] - scaled[i - 1] for i in range(1, len(scaled))]
+
     payload = bytearray((common,))
     payload += _put_varint(len(deltas))
     for d in deltas:
         payload += _put_varint(_zigzag(d))
+
+    # Preserve the exact separators between numbers.
     for i in range(len(vals) - 1):
         s, e = vals[i][1], vals[i + 1][0]
-        payload += _put_varint(e - s)
-        payload += data[s:e]
-    record = bytes((1,)) + struct.pack("<I", end - start) + _put_varint(len(payload)) + payload
-    return record if len(record) < end - start else None
+        sep = data[s:e]
+        payload += _put_varint(len(sep))
+        payload += sep
+
+    # tag + original length + payload. All fields are varints.
+    record = bytes((_RUN,)) + _put_varint(end - start) + bytes(payload)
+    return record if len(record) + 1 < end - start else None
 
 
 def transform(data: bytes) -> bytes:
@@ -112,13 +133,14 @@ def transform(data: bytes) -> bytes:
         data = bytes(data)
     if not data:
         return data
+
     records = bytearray(MAGIC)
     literal = bytearray()
     changed = False
 
-    def flush_literal():
+    def flush_literal() -> None:
         if literal:
-            records.append(0)
+            records.append(_LITERAL)
             records.extend(_put_varint(len(literal)))
             records.extend(literal)
             literal.clear()
@@ -136,16 +158,19 @@ def transform(data: bytes) -> bytes:
                 changed = True
                 i = end
                 continue
+
         j = i + 1
-        while j < n and not (48 <= data[j] <= 57 or data[j] in (43, 45)):
+        while j < n and not (48 <= data[j] <= 57 or data[j] == 45):
             j += 1
         literal.extend(data[i:j])
         i = j
+
     if not changed:
         return data
     flush_literal()
-    records.append(2)
-    return bytes(records) if len(records) < len(data) else data
+    records.append(_END)
+    encoded = bytes(records)
+    return encoded if len(encoded) < len(data) else data
 
 
 def inverse(data: bytes) -> bytes:
@@ -153,35 +178,38 @@ def inverse(data: bytes) -> bytes:
         data = bytes(data)
     if not data.startswith(MAGIC):
         return data
+
     i = len(MAGIC)
     out = bytearray()
     while i < len(data):
         tag = data[i]
         i += 1
-        if tag == 2:
+
+        if tag == _END:
             if i != len(data):
                 raise ValueError("trailing data after DE3 end marker")
             return bytes(out)
-        if tag == 0:
+
+        if tag == _LITERAL:
             length, i = _get_varint(data, i)
             if i + length > len(data):
                 raise ValueError("truncated DE3 literal block")
             out += data[i:i + length]
             i += length
             continue
-        if tag != 1 or i + 4 > len(data):
+
+        if tag != _RUN:
             raise ValueError("invalid DE3 record")
-        original_len = struct.unpack_from("<I", data, i)[0]
-        i += 4
-        plen, i = _get_varint(data, i)
-        if i + plen > len(data):
-            raise ValueError("truncated DE3 run payload")
-        end = i + plen
+
+        original_len, i = _get_varint(data, i)
+        if i >= len(data):
+            raise ValueError("truncated DE3 run")
         scale = data[i]
         i += 1
         count, i = _get_varint(data, i)
-        if count == 0:
-            raise ValueError("empty DE3 run")
+        if count < 3:
+            raise ValueError("invalid DE3 run count")
+
         scaled = []
         cur = 0
         for idx in range(count):
@@ -189,19 +217,21 @@ def inverse(data: bytes) -> bytes:
             d = _unzigzag(z)
             cur = d if idx == 0 else cur + d
             scaled.append(cur)
+
         values = [v * (10 ** scale) for v in scaled]
-        parts = [str(v).encode("ascii") for v in values]
-        run_start = len(out)
+        start_out = len(out)
         for idx in range(count - 1):
-            dl, i = _get_varint(data, i)
-            if i + dl > end:
-                raise ValueError("invalid DE3 delimiter")
-            out += parts[idx]
-            out += data[i:i + dl]
-            i += dl
-        out += parts[-1]
-        if i != end or len(out) - run_start != original_len:
+            out += str(values[idx]).encode("ascii")
+            sep_len, i = _get_varint(data, i)
+            if i + sep_len > len(data):
+                raise ValueError("truncated DE3 separator")
+            out += data[i:i + sep_len]
+            i += sep_len
+        out += str(values[-1]).encode("ascii")
+
+        if len(out) - start_out != original_len:
             raise ValueError("DE3 run length mismatch")
+
     raise ValueError("missing DE3 end marker")
 
 
