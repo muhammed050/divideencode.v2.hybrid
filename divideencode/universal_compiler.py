@@ -148,11 +148,9 @@ def _candidate_pipelines(data,max_candidates=24):
     scored.sort(key=lambda x:(x[0],x[1].name))
     keep=max(3,min(7,max_candidates//4))
     top=[p for _,p in scored[:keep]]
-    # Always retain RAW and the strongest single transforms.
     result=[]; seen=set()
     for p in top:
         if p.name not in seen: result.append(p); seen.add(p.name)
-    # Add ordered two-stage combinations only among promising transforms.
     for a in top:
         for b in top:
             if a==b:continue
@@ -170,7 +168,10 @@ def _candidate_pipelines(data,max_candidates=24):
     return result[:max_candidates] or [Pipeline(())]
 
 def plan(data,max_candidates=32):
-    return _candidate_pipelines(bytes(data),max_candidates=max_candidates)
+    # UBC's expensive operation is full-file DE2. Never allow the planner's
+    # public budget to silently explode; the caller's mode already controls
+    # the intended search depth.
+    return _candidate_pipelines(bytes(data),max_candidates=min(max_candidates, 3))
 
 def compile_ir(data,pipeline,*,verify=True):
     src=bytes(data); payload=encode_pipeline(src,pipeline)
