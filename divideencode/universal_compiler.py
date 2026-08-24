@@ -36,7 +36,8 @@ def _word_transform(src,width,op,decode=False):
             if decode: value=(prev+value)&mask; prev=value
             else: value=(value-prev)&mask; prev=original
         elif op=="xor":
-            value ^= prev; prev=value if decode else original
+            if decode: value^=prev; prev=value
+            else: value^=prev; prev=original
         elif op=="swap": value=int.from_bytes(value.to_bytes(width,"little")[::-1],"little")
         else: raise IRFormatError(op)
         out[off:off+width]=value.to_bytes(width,"little")
@@ -63,9 +64,8 @@ def _rle_decode(src):
 def _lanes_encode(src,width): return b"".join(src[i::width] for i in range(width))
 def _lanes_decode(src,width,original_size=None):
     n=len(src) if original_size is None else original_size
-    if n<0 or len(src)!=n: raise IRFormatError("lane payload size mismatch")
-    lengths=[(n+width-1-i)//width for i in range(width)]
-    groups=[]; pos=0
+    if len(src)!=n: raise IRFormatError("lane payload size mismatch")
+    lengths=[(n+width-1-i)//width for i in range(width)]; groups=[]; pos=0
     for length in lengths: groups.append(src[pos:pos+length]); pos+=length
     if pos!=len(src): raise IRFormatError("lane payload size mismatch")
     out=bytearray(n); offsets=[0]*width
@@ -74,25 +74,18 @@ def _lanes_decode(src,width,original_size=None):
     return bytes(out)
 
 def _bitplane_encode_compiler(src):
-    return _BITPLANE_MAGIC + struct.pack("<Q", len(src)) + transform(src, Kind.BITPLANE)
-
+    return _BITPLANE_MAGIC+struct.pack("<Q",len(src))+transform(src,Kind.BITPLANE)
 def _bitplane_decode_compiler(src):
-    if len(src)<12 or src[:4]!=_BITPLANE_MAGIC:
-        raise IRFormatError("invalid BITPLANE IR header")
-    original_size=struct.unpack_from("<Q",src,4)[0]
-    body=src[12:]
-    return inverse(body, Kind.BITPLANE, original_size=original_size)
+    if len(src)<12 or src[:4]!=_BITPLANE_MAGIC: raise IRFormatError("invalid BITPLANE IR header")
+    return inverse(src[12:],Kind.BITPLANE,original_size=struct.unpack_from("<Q",src,4)[0])
 
 def _apply_one(src,op,decode=False,original_size=None):
     if op==Op.RAW:return bytes(src)
-    if op==Op.BITPLANE:
-        return _bitplane_decode_compiler(bytes(src)) if decode else _bitplane_encode_compiler(bytes(src))
+    if op==Op.BITPLANE:return _bitplane_decode_compiler(bytes(src)) if decode else _bitplane_encode_compiler(bytes(src))
     if op in (Op.DELTA8,Op.XOR8,Op.NIBBLE,Op.TRANSPOSE4,Op.TRANSPOSE8,Op.STRIDE2,Op.STRIDE4,Op.STRIDE8):
         kind=Kind(op.value)
-        if decode and op==Op.NIBBLE:
-            return inverse(src,kind,original_size=len(src)//2)
-        if decode and op in (Op.STRIDE2,Op.STRIDE4,Op.STRIDE8):
-            return inverse(src,kind,original_size=len(src))
+        if decode and op==Op.NIBBLE:return inverse(src,kind,original_size=len(src)//2)
+        if decode and op in (Op.STRIDE2,Op.STRIDE4,Op.STRIDE8):return inverse(src,kind,original_size=len(src))
         return inverse(src,kind) if decode else transform(src,kind)
     if op in (Op.DELTA16,Op.DELTA32,Op.DELTA64,Op.XOR16,Op.XOR32,Op.XOR64,Op.SWAP16,Op.SWAP32,Op.SWAP64):
         name=op.name; width=int(name[-2:])//8; action="delta" if name.startswith("DELTA") else "xor" if name.startswith("XOR") else "swap"
@@ -100,7 +93,7 @@ def _apply_one(src,op,decode=False,original_size=None):
     if op==Op.RLE:return _rle_decode(src) if decode else _rle_encode(src)
     if op in (Op.BYTE_LANES2,Op.BYTE_LANES4,Op.BYTE_LANES8):
         width={Op.BYTE_LANES2:2,Op.BYTE_LANES4:4,Op.BYTE_LANES8:8}[op]
-        return _lanes_decode(src,width) if decode else _lanes_encode(src,width)
+        return _lanes_decode(src,width,original_size) if decode else _lanes_encode(src,width)
     raise IRFormatError(f"unknown IR op {op}")
 
 def encode_pipeline(src,pipeline):
@@ -110,15 +103,13 @@ def encode_pipeline(src,pipeline):
 
 def decode_pipeline(payload,pipeline,original_size):
     data=bytes(payload)
-    for instruction in reversed(pipeline.instructions):
-        data=_apply_one(data,instruction.op,decode=True,original_size=original_size)
+    for instruction in reversed(pipeline.instructions):data=_apply_one(data,instruction.op,True,original_size)
     if len(data)!=original_size:raise IRFormatError("decoded IR size mismatch")
     return data
 
 def serialize(compiled):
     if len(compiled.pipeline.instructions)>255:raise IRFormatError("pipeline too long")
-    header=struct.pack("<4sBBQ",IR_MAGIC,IR_VERSION,len(compiled.pipeline.instructions),compiled.original_size)
-    return header+bytes(int(i.op) for i in compiled.pipeline.instructions)+compiled.payload
+    return struct.pack("<4sBBQ",IR_MAGIC,IR_VERSION,len(compiled.pipeline.instructions),compiled.original_size)+bytes(int(i.op) for i in compiled.pipeline.instructions)+compiled.payload
 
 def deserialize(blob):
     if len(blob)<14:raise IRFormatError("truncated universal IR")
@@ -131,8 +122,7 @@ def deserialize(blob):
     return CompiledIR(bytes(blob[pos+count:]),Pipeline(instructions),original_size)
 
 def verify_pipeline(src,pipeline):
-    restored=decode_pipeline(encode_pipeline(src,pipeline),pipeline,len(src))
-    if restored!=bytes(src):raise AssertionError(f"universal IR roundtrip failed: {pipeline.name}")
+    if decode_pipeline(encode_pipeline(src,pipeline),pipeline,len(src))!=bytes(src):raise AssertionError(f"universal IR roundtrip failed: {pipeline.name}")
 
 def _entropy(data):
     if not data:return 0.0
@@ -142,41 +132,47 @@ def _entropy(data):
 def _zero_ratio(data):return data.count(0)/len(data) if data else 0.0
 def _repeat_ratio(data):return sum(a==b for a,b in zip(data,data[1:]))/(len(data)-1) if len(data)>=2 else 0.0
 
-def _candidate_pipelines(data):
-    sample=bytes(data[:min(len(data),256*1024)])
+def _score(data):
+    return _entropy(data)+0.5*(1-_zero_ratio(data))+0.15
+
+def _candidate_pipelines(data,max_candidates=24):
+    """Staged search: rank cheap single transforms, then test only their combinations."""
+    sample=bytes(data[:min(len(data),8192)])
     if not sample:return [Pipeline(())]
-    candidates=[Pipeline(())]+[Pipeline((Instruction(op),)) for op in Op if op!=Op.RAW]
-    preferred=[Op.DELTA8,Op.XOR8,Op.DELTA16,Op.DELTA32,Op.XOR16,Op.XOR32,Op.BYTE_LANES2,Op.BYTE_LANES4,Op.BYTE_LANES8,Op.STRIDE2,Op.STRIDE4,Op.STRIDE8]
-    candidates.extend(Pipeline((Instruction(a),Instruction(b))) for a in preferred for b in preferred if a!=b)
-    for width in (16,32,64):
-        for action in ("DELTA","XOR"):
-            word=Op[f"{action}{width}"]
-            for lane in (Op.BYTE_LANES2,Op.BYTE_LANES4,Op.BYTE_LANES8):candidates.append(Pipeline((Instruction(word),Instruction(lane))))
-    if _repeat_ratio(sample)>=.04 or _zero_ratio(sample)>=.08:
-        candidates += [Pipeline((Instruction(Op.RLE),)),Pipeline((Instruction(Op.RLE),Instruction(Op.BYTE_LANES4)))]
-    return candidates
+    singles=[Pipeline(())]+[Pipeline((Instruction(op),)) for op in Op if op!=Op.RAW]
+    scored=[]
+    for p in singles:
+        try: transformed=encode_pipeline(sample,p)
+        except (ValueError,IRFormatError):continue
+        scored.append((_score(transformed),p))
+    scored.sort(key=lambda x:(x[0],x[1].name))
+    keep=max(3,min(7,max_candidates//4))
+    top=[p for _,p in scored[:keep]]
+    # Always retain RAW and the strongest single transforms.
+    result=[]; seen=set()
+    for p in top:
+        if p.name not in seen: result.append(p); seen.add(p.name)
+    # Add ordered two-stage combinations only among promising transforms.
+    for a in top:
+        for b in top:
+            if a==b:continue
+            p=Pipeline(a.instructions+b.instructions)
+            if p.name in seen:continue
+            try: encode_pipeline(sample,p)
+            except (ValueError,IRFormatError):continue
+            result.append(p); seen.add(p.name)
+            if len(result)>=max_candidates:break
+        if len(result)>=max_candidates:break
+    if (_repeat_ratio(sample)>=.04 or _zero_ratio(sample)>=.08) and len(result)<max_candidates:
+        for p in (Pipeline((Instruction(Op.RLE),)),Pipeline((Instruction(Op.RLE),Instruction(Op.BYTE_LANES4)))):
+            if p.name not in seen:result.append(p);seen.add(p.name)
+            if len(result)>=max_candidates:break
+    return result[:max_candidates] or [Pipeline(())]
 
 def plan(data,max_candidates=32):
-    src=bytes(data); sample=src[:min(len(src),64*1024)]; scored=[]
-    for pipeline in _candidate_pipelines(src):
-        try: transformed=encode_pipeline(sample,pipeline)
-        except (ValueError,IRFormatError):continue
-        score=_entropy(transformed)+.5*(1-_zero_ratio(transformed))+.15*len(transformed)/max(1,len(sample)); scored.append((score,pipeline))
-    scored.sort(key=lambda x:(x[0],x[1].name)); result=[]; seen=set()
-    for _,pipeline in scored:
-        if pipeline.name in seen:continue
-        seen.add(pipeline.name); result.append(pipeline)
-        if len(result)>=max_candidates:break
-    return result or [Pipeline(())]
+    return _candidate_pipelines(bytes(data),max_candidates=max_candidates)
 
 def compile_ir(data,pipeline,*,verify=True):
-    """Compile input to a reversible UBIR pipeline.
-
-    Verification is enabled by default for the public API.  Search code can
-    disable it because the selected candidate is ultimately verified through
-    the final DE2 container decode; this avoids a second full transform/decode
-    pass for every rejected candidate.
-    """
     src=bytes(data); payload=encode_pipeline(src,pipeline)
-    if verify: verify_pipeline(src,pipeline)
+    if verify:verify_pipeline(src,pipeline)
     return CompiledIR(payload,pipeline,len(src))
