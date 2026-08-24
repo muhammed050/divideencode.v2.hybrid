@@ -1,16 +1,12 @@
-"""DE3: fast run-based numeric-factor transform.
+"""DE3: low-overhead numeric-factor preprocessor for DE2.
 
-One linear scan finds adjacent decimal integer runs separated by common
- delimiters. A run is encoded only when the compact factor+delta representation
-is smaller than its original spelling. Untouched bytes and delimiters remain
-byte-exact. The transformed stream is intended to be compressed by DE2.
+Conservative by design: one linear scan, compact run records, one coalesced
+literal stream, and an exact raw fallback when no useful transform exists.
 """
-
 from __future__ import annotations
-
 import struct
 
-MAGIC = b"DE3R1"
+MAGIC = b"DE3R2"
 _DELIMS = b" \t,;|\r\n"
 
 
@@ -45,14 +41,13 @@ def _unzigzag(n: int) -> int:
     return (n >> 1) if not (n & 1) else -((n >> 1) + 1)
 
 
-def _factor10(v: int) -> tuple[int, int]:
-    if v == 0:
-        return 0, 0
+def _factor10(v: int) -> int:
+    v = abs(v)
     scale = 0
-    while v % 10 == 0:
+    while v and v % 10 == 0:
         v //= 10
         scale += 1
-    return v, scale
+    return scale
 
 
 def _number_end(data: bytes, start: int) -> int:
@@ -96,59 +91,68 @@ def _parse_run(data: bytes, start: int):
 
 def _encode_run(data: bytes, start: int, end: int, vals) -> bytes | None:
     numbers = [v for _, _, v in vals]
-    nonzero = [abs(v) for v in numbers if v]
-    common = min(_factor10(v)[1] for v in nonzero) if nonzero else 0
-    scaled = [v // (10 ** common) for v in numbers]
+    common = min((_factor10(v) for v in numbers if v), default=0)
+    divisor = 10 ** common
+    scaled = [v // divisor for v in numbers]
     deltas = [scaled[0]] + [scaled[i] - scaled[i - 1] for i in range(1, len(scaled))]
-
-    payload = bytearray((1, common))
+    payload = bytearray((common,))
     payload += _put_varint(len(deltas))
     for d in deltas:
         payload += _put_varint(_zigzag(d))
-
     for i in range(len(vals) - 1):
         s, e = vals[i][1], vals[i + 1][0]
         payload += _put_varint(e - s)
         payload += data[s:e]
-
     record = bytes((1,)) + struct.pack("<I", end - start) + _put_varint(len(payload)) + payload
-    return record if len(record) < end - start + 1 else None
+    return record if len(record) < end - start else None
 
 
 def transform(data: bytes) -> bytes:
     if not isinstance(data, bytes):
         data = bytes(data)
-    out = bytearray(MAGIC)
+    if not data:
+        return data
+    records = bytearray(MAGIC)
+    literal = bytearray()
+    changed = False
+
+    def flush_literal():
+        if literal:
+            records.append(0)
+            records.extend(_put_varint(len(literal)))
+            records.extend(literal)
+            literal.clear()
+
     i = 0
     n = len(data)
     while i < n:
         run = _parse_run(data, i)
         if run is not None:
             end, vals = run
-            record = _encode_run(data, i, end, vals)
-            if record is not None:
-                out += record
+            rec = _encode_run(data, i, end, vals)
+            if rec is not None:
+                flush_literal()
+                records.extend(rec)
+                changed = True
                 i = end
                 continue
-
-        # Jump directly to the next possible numeric start instead of calling
-        # the parser at every byte. This keeps DE3 linear on incompressible data.
         j = i + 1
         while j < n and not (48 <= data[j] <= 57 or data[j] in (43, 45)):
             j += 1
-        out.append(0)
-        out += _put_varint(j - i)
-        out += data[i:j]
+        literal.extend(data[i:j])
         i = j
-    out.append(2)
-    return bytes(out)
+    if not changed:
+        return data
+    flush_literal()
+    records.append(2)
+    return bytes(records) if len(records) < len(data) else data
 
 
 def inverse(data: bytes) -> bytes:
     if not isinstance(data, bytes):
         data = bytes(data)
     if not data.startswith(MAGIC):
-        raise ValueError("invalid DE3 magic")
+        return data
     i = len(MAGIC)
     out = bytearray()
     while i < len(data):
@@ -166,8 +170,7 @@ def inverse(data: bytes) -> bytes:
             i += length
             continue
         if tag != 1 or i + 4 > len(data):
-            raise ValueError("invalid DE3 run")
-
+            raise ValueError("invalid DE3 record")
         original_len = struct.unpack_from("<I", data, i)[0]
         i += 4
         plen, i = _get_varint(data, i)
@@ -179,7 +182,6 @@ def inverse(data: bytes) -> bytes:
         count, i = _get_varint(data, i)
         if count == 0:
             raise ValueError("empty DE3 run")
-
         scaled = []
         cur = 0
         for idx in range(count):
