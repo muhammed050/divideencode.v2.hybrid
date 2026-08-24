@@ -21,13 +21,30 @@ DEFAULT_MAX_MATCH = 259
 DEFAULT_WINDOW = 1 << 18          # 256 KiB
 MAX_CHAIN = 32
 
+# Large equal runs are common in JSON/CSV/log/text data. Comparing a
+# reasonably large slice is implemented in C by CPython and is much cheaper
+# than comparing one byte at a time in Python. The final tail remains a
+# scalar loop so the exact first mismatch is preserved.
+_MATCH_CHUNK = 64
+
 LIT = 0
 MATCH = 1
 REP = 2
 
 
 def _match_length(data, pos_a, pos_b, max_len):
+    """Return the exact common-prefix length of two data regions.
+
+    The old implementation performed one Python byte comparison per byte.
+    Chunked equality moves the bulk comparison into CPython's C loop while
+    preserving exactly the same result for every pair of positions.
+    """
     l = 0
+    chunk = _MATCH_CHUNK
+    while l + chunk <= max_len:
+        if data[pos_a + l:pos_a + l + chunk] != data[pos_b + l:pos_b + l + chunk]:
+            break
+        l += chunk
     while l < max_len and data[pos_a + l] == data[pos_b + l]:
         l += 1
     return l
@@ -47,10 +64,7 @@ def _best_rep(data, i, reps, window, max_match):
         if best_len and best_len < limit and \
                 data[src + best_len] != data[i + best_len]:
             continue
-        # quick reject just past the current best, then extend
-        l = 0
-        while l < limit and data[src + l] == data[i + l]:
-            l += 1
+        l = _match_length(data, src, i, limit)
         if l > best_len:
             best_len = l
             best_idx = idx
