@@ -1,18 +1,18 @@
-"""DE3 numeric-factor preprocessor for DE2.
+"""DE3: direct numeric factor experiment.
 
-DE3 is intentionally conservative: it does one linear scan, rewrites only
-integer runs that are provably smaller, and otherwise returns the original
-bytes so DE2 remains the authoritative compressor.
+Idea under test, deliberately kept simple:
+1. Read numeric symbols/runs.
+2. Convert each number to an integer.
+3. Find the common factor of 10 by repeatedly dividing by 10.
+4. Store the factor count and the reduced integers.
+5. Reconstruct the original decimal numbers exactly.
 
-The numeric representation is:
-    integer run -> common trailing-zero factor -> ZigZag delta stream
-
-The record format is compact and self-delimiting; no fixed 32-bit payload
-lengths are stored for every run. Signed integers are preserved exactly.
+No delta coding, no entropy model, no pattern scoring and no expensive search.
+DE3 is an experiment around the numeric-factor idea only.
 """
 from __future__ import annotations
 
-MAGIC = b"DE3R3"
+MAGIC = b"DE3F1"
 _LITERAL = 0
 _RUN = 1
 _END = 2
@@ -42,26 +42,19 @@ def _get_varint(data: bytes, pos: int) -> tuple[int, int]:
         shift += 7
 
 
-def _zigzag(n: int) -> int:
-    return (n << 1) if n >= 0 else ((-n << 1) - 1)
-
-
-def _unzigzag(n: int) -> int:
-    return (n >> 1) if not (n & 1) else -((n >> 1) + 1)
-
-
 def _factor10(v: int) -> int:
+    """Repeatedly divide by 10 and return how many divisions succeeded."""
     v = abs(v)
-    scale = 0
+    count = 0
     while v and v % 10 == 0:
         v //= 10
-        scale += 1
-    return scale
+        count += 1
+    return count
 
 
 def _number_end(data: bytes, start: int) -> int:
     i = start
-    if i < len(data) and data[i] == 45:  # '-'
+    if i < len(data) and data[i] == 45:
         i += 1
     while i < len(data) and 48 <= data[i] <= 57:
         i += 1
@@ -69,11 +62,12 @@ def _number_end(data: bytes, start: int) -> int:
 
 
 def _valid_number(data: bytes, a: int, b: int) -> bool:
-    if b <= a or data[a] == 43:  # '+' is rejected because reconstruction changes it
+    if b <= a or data[a] == 43:
         return False
     if data[a] == 45 and b == a + 1:
         return False
     digits = data[a:b].lstrip(b"-")
+    # Preserve decimal spelling exactly; don't rewrite 001 -> 1.
     return not (len(digits) > 1 and digits.startswith(b"0"))
 
 
@@ -81,11 +75,14 @@ def _parse_run(data: bytes, start: int):
     n = len(data)
     if start >= n or not (48 <= data[start] <= 57 or data[start] == 45):
         return None
+
     b = _number_end(data, start)
     if not _valid_number(data, start, b):
         return None
+
     vals = [(start, b, int(data[start:b]))]
     p = b
+
     while p < n and data[p] in _DELIMS:
         q = p
         while q < n and data[q] in _DELIMS:
@@ -97,35 +94,40 @@ def _parse_run(data: bytes, start: int):
             break
         vals.append((q, e, int(data[q:e])))
         p = e
-    return (p, vals) if len(vals) >= 3 else None
+
+    return (p, vals) if len(vals) >= 2 else None
 
 
 def _encode_run(data: bytes, start: int, end: int, vals) -> bytes | None:
     numbers = [v for _, _, v in vals]
-    # Factoring is useful only when every non-zero value shares the factor.
-    scales = [_factor10(v) for v in numbers if v]
-    common = min(scales, default=0)
-    if common == 0:
+
+    # The requested operation: repeatedly divide by 10 while ALL values
+    # can be divided exactly. For example 1000, 2000, 3000 -> /10 ->
+    # 100,200,300 -> /10 -> 10,20,30 -> /10 -> 1,2,3.
+    common = min((_factor10(v) for v in numbers if v), default=0)
+    if common <= 0:
         return None
+
     divisor = 10 ** common
-    scaled = [v // divisor for v in numbers]
-    deltas = [scaled[0]] + [scaled[i] - scaled[i - 1] for i in range(1, len(scaled))]
+    reduced = [v // divisor for v in numbers]
 
-    payload = bytearray((common,))
-    payload += _put_varint(len(deltas))
-    for d in deltas:
-        payload += _put_varint(_zigzag(d))
+    payload = bytearray()
+    payload.append(common)
+    payload.extend(_put_varint(len(reduced)))
 
-    # Preserve the exact separators between numbers.
+    for v in reduced:
+        # signed magnitude with a tiny ZigZag-like representation.
+        z = (v << 1) if v >= 0 else ((-v << 1) - 1)
+        payload.extend(_put_varint(z))
+
+    # Store the exact separators between numbers.
     for i in range(len(vals) - 1):
-        s, e = vals[i][1], vals[i + 1][0]
-        sep = data[s:e]
-        payload += _put_varint(len(sep))
-        payload += sep
+        sep = data[vals[i][1]:vals[i + 1][0]]
+        payload.extend(_put_varint(len(sep)))
+        payload.extend(sep)
 
-    # tag + original length + payload. All fields are varints.
     record = bytes((_RUN,)) + _put_varint(end - start) + bytes(payload)
-    return record if len(record) + 1 < end - start else None
+    return record
 
 
 def transform(data: bytes) -> bytes:
@@ -167,10 +169,14 @@ def transform(data: bytes) -> bytes:
 
     if not changed:
         return data
+
     flush_literal()
     records.append(_END)
-    encoded = bytes(records)
-    return encoded if len(encoded) < len(data) else data
+    return bytes(records)
+
+
+def _unzigzag(z: int) -> int:
+    return (z >> 1) if not (z & 1) else -((z >> 1) + 1)
 
 
 def inverse(data: bytes) -> bytes:
@@ -181,6 +187,7 @@ def inverse(data: bytes) -> bytes:
 
     i = len(MAGIC)
     out = bytearray()
+
     while i < len(data):
         tag = data[i]
         i += 1
@@ -193,8 +200,8 @@ def inverse(data: bytes) -> bytes:
         if tag == _LITERAL:
             length, i = _get_varint(data, i)
             if i + length > len(data):
-                raise ValueError("truncated DE3 literal block")
-            out += data[i:i + length]
+                raise ValueError("truncated DE3 literal")
+            out.extend(data[i:i + length])
             i += length
             continue
 
@@ -204,30 +211,28 @@ def inverse(data: bytes) -> bytes:
         original_len, i = _get_varint(data, i)
         if i >= len(data):
             raise ValueError("truncated DE3 run")
+
         scale = data[i]
         i += 1
         count, i = _get_varint(data, i)
-        if count < 3:
+        if count < 2:
             raise ValueError("invalid DE3 run count")
 
-        scaled = []
-        cur = 0
-        for idx in range(count):
+        values = []
+        divisor = 10 ** scale
+        for _ in range(count):
             z, i = _get_varint(data, i)
-            d = _unzigzag(z)
-            cur = d if idx == 0 else cur + d
-            scaled.append(cur)
+            values.append(_unzigzag(z) * divisor)
 
-        values = [v * (10 ** scale) for v in scaled]
         start_out = len(out)
-        for idx in range(count - 1):
-            out += str(values[idx]).encode("ascii")
-            sep_len, i = _get_varint(data, i)
-            if i + sep_len > len(data):
-                raise ValueError("truncated DE3 separator")
-            out += data[i:i + sep_len]
-            i += sep_len
-        out += str(values[-1]).encode("ascii")
+        for idx, value in enumerate(values):
+            out.extend(str(value).encode("ascii"))
+            if idx + 1 < count:
+                sep_len, i = _get_varint(data, i)
+                if i + sep_len > len(data):
+                    raise ValueError("truncated DE3 separator")
+                out.extend(data[i:i + sep_len])
+                i += sep_len
 
         if len(out) - start_out != original_len:
             raise ValueError("DE3 run length mismatch")
