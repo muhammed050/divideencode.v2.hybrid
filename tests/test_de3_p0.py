@@ -26,7 +26,8 @@ def test_random_roundtrip():
 def test_corruption_rejected():
     data = b"abcde" * 5000
     blob = bytearray(compress(data))
-    blob[-1] ^= 1
+    payload_offset = 4 + 23 + 286 + 30
+    blob[payload_offset] ^= 1
     with pytest.raises(Exception):
         decompress(blob)
 
