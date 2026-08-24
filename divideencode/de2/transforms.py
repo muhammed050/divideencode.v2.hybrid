@@ -16,7 +16,7 @@ def _mask(w):
 def _words(data, w):
     nw = len(data) // w
     if w == 1:
-        return list(data[:nw])
+        return data[:nw]
     a = array.array(_TYPECODES[w])
     a.frombytes(bytes(data[:nw * w]))
     if sys.byteorder != "little":
@@ -26,7 +26,7 @@ def _words(data, w):
 
 def _unwords(vals, w):
     if w == 1:
-        return bytes(bytearray(vals))
+        return bytes(vals)
     a = array.array(_TYPECODES[w], vals)
     if sys.byteorder != "little":
         a.byteswap()
@@ -34,45 +34,67 @@ def _unwords(vals, w):
 
 
 def _delta_core(data, w, zigzag):
+    """Encode word deltas using a preallocated byte buffer.
+
+    The old implementation created a new Python bytes object with
+    ``int.to_bytes`` for every word. For multi-megabyte blocks that creates
+    millions of temporary objects. Slice assignment keeps the same exact
+    wire format while reducing allocation/GC overhead substantially.
+    """
     vals = _words(data, w)
     nw = len(vals)
-    tail = bytes(data[nw * w:])
+    usable = nw * w
+    tail = data[usable:]
+    if not nw:
+        return bytes(tail)
+
     mask = _mask(w)
-    out = bytearray()
-    if nw:
-        prev = int(vals[0])
-        out += prev.to_bytes(w, "little")
-        half = 1 << (8 * w - 1)
-        full = 1 << (8 * w)
-        for j in range(1, nw):
-            x = int(vals[j])
-            d = (x - prev) & mask
-            if zigzag:
-                sd = d - full if d >= half else d
-                d = ((sd << 1) ^ (sd >> (8 * w))) & mask
-            out += d.to_bytes(w, "little")
-            prev = x
-    return bytes(out) + tail
+    bits = 8 * w
+    half = 1 << (bits - 1)
+    full = 1 << bits
+    out = bytearray(usable + len(tail))
+
+    prev = int(vals[0])
+    out[:w] = prev.to_bytes(w, "little")
+    pos = w
+    for j in range(1, nw):
+        x = int(vals[j])
+        d = (x - prev) & mask
+        if zigzag:
+            sd = d - full if d >= half else d
+            d = ((sd << 1) ^ (sd >> bits)) & mask
+        out[pos:pos + w] = d.to_bytes(w, "little")
+        pos += w
+        prev = x
+
+    out[usable:] = tail
+    return bytes(out)
 
 
 def _undelta_core(payload, w, zigzag):
     vals = _words(payload, w)
     nw = len(vals)
-    tail = payload[nw * w:]
+    usable = nw * w
+    tail = payload[usable:]
+    if not nw:
+        return bytes(tail)
+
     mask = _mask(w)
-    out = bytearray()
-    if nw:
-        prev = int(vals[0])
-        out += prev.to_bytes(w, "little")
-        for j in range(1, nw):
-            d = int(vals[j])
-            if zigzag:
-                sd = (d >> 1) ^ -(d & 1)
-                prev = (prev + sd) & mask
-            else:
-                prev = (prev + d) & mask
-            out += prev.to_bytes(w, "little")
-    return bytes(out) + bytes(tail)
+    out = bytearray(usable + len(tail))
+    prev = int(vals[0])
+    out[:w] = prev.to_bytes(w, "little")
+    pos = w
+    for j in range(1, nw):
+        d = int(vals[j])
+        if zigzag:
+            sd = (d >> 1) ^ -(d & 1)
+            prev = (prev + sd) & mask
+        else:
+            prev = (prev + d) & mask
+        out[pos:pos + w] = prev.to_bytes(w, "little")
+        pos += w
+    out[usable:] = tail
+    return bytes(out)
 
 
 def _plane_split(data, sw):
@@ -98,13 +120,7 @@ def delta_encode(data, w=4, zigzag=True):
 
 
 def numeric_encode(data, mono=None, hi_gain=None, _enc=None):
-    """Bounded numeric search with cheap LZ screening.
-
-    Candidate transforms are first ranked using FAST LZ. Only the best
-    transform is then encoded with the caller's real codec/level. This
-    keeps the BALANCED/MAX output quality while removing most expensive
-    repeated deep LZ searches from the candidate-selection phase.
-    """
+    """Bounded numeric search with cheap LZ screening."""
     if _enc is None:
         _enc = lz.encode
 
@@ -118,8 +134,6 @@ def numeric_encode(data, mono=None, hi_gain=None, _enc=None):
     candidates = []
     for w in order:
         transformed = _delta_core(data, w, True)
-        # Screening is deliberately FAST. The actual winner is re-encoded
-        # below with the original codec so BALANCED/MAX quality is retained.
         try:
             screened = lz.encode_v2(transformed, level="FAST")
         except AttributeError:
@@ -131,9 +145,6 @@ def numeric_encode(data, mono=None, hi_gain=None, _enc=None):
     best_frame = _enc(best_transformed)
     best_tmeta = b"D" + bytes((WORD_SIZES.index(best_w), 1))
 
-    # Only test the plane split when the FAST screen says it has a realistic
-    # chance to beat the selected delta. This is a cheap transform, while a
-    # second full DE2/LZ encode is not.
     if best_w >= 2:
         split = _plane_split(best_transformed, best_w)
         try:
