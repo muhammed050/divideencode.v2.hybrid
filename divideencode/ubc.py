@@ -1,92 +1,138 @@
-"""Universal Binary Compiler (UBC): bytes -> UBC language -> DE2."""
+"""Universal Binary Compiler (UBC) public API.
+
+UBC is a reversible compiler front-end for the DE2 backend.  It compiles
+arbitrary bytes into the project's Universal Binary IR pipeline rather than
+expanding every input byte into a fixed ``OP_BYTE`` instruction.
+
+The compiler lives in :mod:`divideencode.universal_compiler`; the container
+and DE2 backend live in :mod:`divideencode.universal_binary`.  Keeping this
+module as the UBC facade gives callers one stable API while making UBC a real
+IR compiler instead of a byte-for-byte instruction wrapper.
+"""
 from __future__ import annotations
 
-import struct
-import zlib
-
-MAGIC = b"UBC1"
-VERSION = 1
-OP_BYTE = 0x01
-OP_END = 0x00
-_HEADER = struct.Struct("<4sBBQII")
+from .universal_binary import (
+    SearchMode,
+    Analysis,
+    Result,
+    analyze,
+    compress as _compress,
+    compress_with_stats as _compress_with_stats,
+    decompress as _decompress,
+    rank_candidates,
+)
 
 
 class UBCError(ValueError):
-    pass
+    """Raised for invalid UBC input or a corrupted UBC container."""
 
 
-def encode(data: bytes | bytearray | memoryview) -> bytes:
-    """Translate arbitrary bytes into the universal UBC binary language."""
+def encode(
+    data: bytes | bytearray | memoryview,
+    *,
+    mode: SearchMode | str = SearchMode.BALANCED,
+) -> bytes:
+    """Compile arbitrary bytes to a serialized Universal Binary IR program.
+
+    This intentionally returns the IR program, not a DE2 container.  The
+    compiler uses the same reversible pipeline planner as UBIR2.
+    """
+    from .universal_compiler import compile_ir, serialize, plan
+
     src = bytes(data)
-    body = bytearray(2 * len(src) + 1)
-    p = 0
-    for value in src:
-        body[p] = OP_BYTE
-        body[p + 1] = value
-        p += 2
-    body[p] = OP_END
-    crc = zlib.crc32(src) & 0xFFFFFFFF
-    return _HEADER.pack(MAGIC, VERSION, 0, len(src), len(body), crc) + body
+    pipelines = plan(src, max_candidates={
+        SearchMode.FAST: 8,
+        SearchMode.BALANCED: 24,
+        SearchMode.MAX: 64,
+    }[SearchMode[mode.upper()] if isinstance(mode, str) else mode])
+
+    # ``encode`` is the language/compiler API: select the best IR by the
+    # transformed representation itself, not by adding a DE2 container here.
+    # DE2-aware selection remains in ``compress`` below.
+    best = min(
+        (compile_ir(src, p, verify=True) for p in pipelines),
+        key=lambda ir: len(ir.payload),
+    )
+    return serialize(best)
 
 
 def decode(program: bytes | bytearray | memoryview) -> bytes:
-    """Translate a UBC binary-language program back to the exact bytes."""
-    blob = bytes(program)
-    if len(blob) < _HEADER.size:
-        raise UBCError("truncated UBC program")
-    magic, version, flags, original_size, body_size, crc = _HEADER.unpack_from(blob)
-    if magic != MAGIC or version != VERSION or flags != 0:
-        raise UBCError("invalid UBC program header")
-    if body_size != len(blob) - _HEADER.size:
-        raise UBCError("UBC body size mismatch")
+    """Decode a serialized Universal Binary IR program exactly."""
+    from .universal_compiler import deserialize, decode_pipeline
 
-    body = blob[_HEADER.size:]
-    out = bytearray()
-    p = 0
-    while p < len(body):
-        opcode = body[p]
-        p += 1
-        if opcode == OP_END:
-            if p != len(body):
-                raise UBCError("data after UBC END")
-            break
-        if opcode != OP_BYTE or p >= len(body):
-            raise UBCError("invalid UBC instruction")
-        out.append(body[p])
-        p += 1
-    else:
-        raise UBCError("missing UBC END")
-
-    if len(out) != original_size:
-        raise UBCError("UBC original size mismatch")
-    if zlib.crc32(out) & 0xFFFFFFFF != crc:
-        raise UBCError("UBC checksum mismatch")
-    return bytes(out)
+    compiled = deserialize(bytes(program))
+    return decode_pipeline(compiled.payload, compiled.pipeline, compiled.original_size)
 
 
-def compile(data: bytes | bytearray | memoryview) -> bytes:
-    return encode(data)
+def compile(data: bytes | bytearray | memoryview, **kwargs) -> bytes:
+    return encode(data, **kwargs)
 
 
 def decompile(program: bytes | bytearray | memoryview) -> bytes:
     return decode(program)
 
 
-def compress(data: bytes | bytearray | memoryview, **kwargs) -> bytes:
-    """Direct UBC -> DE2 backend. No selector or extra transform is used."""
-    from .de2 import compress as de2_compress
-    return de2_compress(encode(data), **kwargs)
+def compress(
+    data: bytes | bytearray | memoryview,
+    *,
+    mode: SearchMode | str = SearchMode.BALANCED,
+    level: str = "BALANCED",
+    block_size: int = 1 << 20,
+) -> bytes:
+    """Compile arbitrary bytes to UBC IR and encode the IR with DE2."""
+    return _compress(
+        bytes(data), mode=mode, level=level, block_size=block_size
+    )
 
 
-def decompress(blob: bytes | bytearray | memoryview, *, verify: bool = True) -> bytes:
-    """Direct DE2 -> UBC -> original bytes backend."""
-    from .de2 import decompress as de2_decompress
-    return decode(de2_decompress(bytes(blob), verify=verify))
+def compress_with_stats(
+    data: bytes | bytearray | memoryview,
+    *,
+    mode: SearchMode | str = SearchMode.BALANCED,
+    level: str = "BALANCED",
+    block_size: int = 1 << 20,
+) -> Result:
+    """Return the UBC+DE2 result and compiler statistics."""
+    return _compress_with_stats(
+        bytes(data), mode=mode, level=level, block_size=block_size
+    )
+
+
+def decompress(
+    blob: bytes | bytearray | memoryview,
+    *,
+    verify: bool = True,
+) -> bytes:
+    """Decode a DE2-backed UBC container back to the original bytes."""
+    return _decompress(bytes(blob), verify=verify)
 
 
 def compile_to_de2(data: bytes | bytearray | memoryview, **kwargs) -> bytes:
     return compress(data, **kwargs)
 
 
-def decompile_from_de2(blob: bytes | bytearray | memoryview, *, verify: bool = True) -> bytes:
+def decompile_from_de2(
+    blob: bytes | bytearray | memoryview,
+    *,
+    verify: bool = True,
+) -> bytes:
     return decompress(blob, verify=verify)
+
+
+__all__ = [
+    "UBCError",
+    "SearchMode",
+    "Analysis",
+    "Result",
+    "analyze",
+    "rank_candidates",
+    "encode",
+    "decode",
+    "compile",
+    "decompile",
+    "compress",
+    "compress_with_stats",
+    "decompress",
+    "compile_to_de2",
+    "decompile_from_de2",
+]
